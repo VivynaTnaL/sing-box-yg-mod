@@ -1,5 +1,12 @@
 #!/bin/bash
+if [[ -e /etc/sing-box-chain/legacy-managed ]]; then
+    echo "本机代理已由 chain/ 工具接管。请使用该工具更新配置，避免旧菜单覆盖端口、凭据或服务。"
+    exit 1
+fi
 export LANG=en_US.UTF-8
+# Keep the reviewed local script when installing the shortcut.
+SB_SCRIPT_SOURCE=$(readlink -f -- "${BASH_SOURCE[0]}")
+umask 077
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -11,7 +18,7 @@ green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
-readp(){ read -p "$(yellow "$1")" $2;}
+readp(){ IFS= read -r -p "$(yellow "$1")" "$2";}
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
 stty erase $'\b' 2>/dev/null || stty erase '^H' 2>/dev/null
 #[[ -e /etc/hosts ]] && grep -qE '^ *172.65.251.78 gitlab.com' /etc/hosts || echo -e '\n172.65.251.78 gitlab.com' >> /etc/hosts
@@ -63,7 +70,7 @@ if [ ! -f sbyg_update ]; then
 green "首次安装Sing-box-yg脚本必要的依赖……"
 if command -v apk >/dev/null 2>&1; then
 apk update
-apk add bash libc6-compat jq openssl procps busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux
+apk add bash python3 libc6-compat jq openssl procps busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux
 apk add virt-what
 else
 if [[ $release = Centos && ${vsid} =~ 8 ]]; then
@@ -175,37 +182,45 @@ fi
 }
 
 close(){
-systemctl stop firewalld.service >/dev/null 2>&1
-systemctl disable firewalld.service >/dev/null 2>&1
-setenforce 0 >/dev/null 2>&1
-ufw disable >/dev/null 2>&1
-iptables -P INPUT ACCEPT >/dev/null 2>&1
-iptables -P FORWARD ACCEPT >/dev/null 2>&1
-iptables -P OUTPUT ACCEPT >/dev/null 2>&1
-iptables -t mangle -F >/dev/null 2>&1
-iptables -F >/dev/null 2>&1
-iptables -X >/dev/null 2>&1
-netfilter-persistent save >/dev/null 2>&1
-if [[ -n $(apachectl -v 2>/dev/null) ]]; then
-systemctl stop httpd.service >/dev/null 2>&1
-systemctl disable httpd.service >/dev/null 2>&1
-service apache2 stop >/dev/null 2>&1
-systemctl disable apache2 >/dev/null 2>&1
-fi
-sleep 1
-green "执行开放端口，关闭防火墙完毕"
+yellow "已取消关闭防火墙、清空规则及停用其他服务的功能。请仅放行代理监听端口，并保留 SSH。"
 }
 
 openyn(){
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-readp "是否开放端口，关闭防火墙？\n1、是，执行 (回车默认)\n2、否，跳过！自行处理\n请选择【1-2】：" action
-if [[ -z $action ]] || [[ "$action" = "1" ]]; then
-close
-elif [[ "$action" = "2" ]]; then
-echo
-else
-red "输入错误,请重新选择" && openyn
+yellow "保留现有防火墙和 SELinux 设置。请按实际协议放行 TCP/UDP 监听端口，并保留 SSH 管理端口。"
+}
+
+# Download into an isolated directory. A failed download must never reuse an old archive.
+fetch_sbcore(){
+local requested="$1" stage name actual
+[[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { red "内核版本号无效"; return 1; }
+stage=$(mktemp -d /etc/s-box/.core.XXXXXX) || return 1
+name="sing-box-$requested-linux-$cpu"
+if ! curl --fail --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 \
+-o "$stage/core.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v$requested/$name.tar.gz"; then
+rm -rf -- "$stage"
+return 1
 fi
+# Extract only the expected executable, never arbitrary archive paths.
+if ! tar -xOzf "$stage/core.tar.gz" "$name/sing-box" > "$stage/sing-box" || [[ ! -s "$stage/sing-box" ]]; then
+rm -rf -- "$stage"
+return 1
+fi
+chmod 700 "$stage/sing-box" || { rm -rf -- "$stage"; return 1; }
+actual=$("$stage/sing-box" version 2>/dev/null | awk '/^sing-box version / {print $3}')
+if [[ "$actual" != "$requested" ]]; then
+rm -rf -- "$stage"
+return 1
+fi
+if [[ -f /etc/s-box/sb.json ]] && ! "$stage/sing-box" check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+red "新内核不兼容当前配置，保留旧内核和配置。"
+rm -rf -- "$stage"
+return 1
+fi
+if [[ -f /etc/s-box/sing-box ]]; then
+cp -p /etc/s-box/sing-box /etc/s-box/sing-box.previous || { rm -rf -- "$stage"; return 1; }
+fi
+mv -f -- "$stage/sing-box" /etc/s-box/sing-box || { rm -rf -- "$stage"; return 1; }
+rm -rf -- "$stage"
 }
 
 inssb(){
@@ -219,23 +234,11 @@ sbcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest | grep -o
 else
 sbcore='1.10.7'
 fi
-sbname="sing-box-$sbcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-mv /etc/s-box/$sbname/sing-box /etc/s-box
-rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-if [[ -f '/etc/s-box/sing-box' ]]; then
-chown root:root /etc/s-box/sing-box
-chmod +x /etc/s-box/sing-box
-blue "成功安装 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
-sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-else
-red "下载 Sing-box 内核不完整，安装失败，请再运行安装一次" && exit
+if ! fetch_sbcore "$sbcore"; then
+red "内核下载或检查失败，安装已停止"
+exit 1
 fi
-else
-red "下载 Sing-box 内核失败，请再运行安装一次，并检测VPS的网络是否可以访问Github" && exit
-fi
+sbnh=$(/etc/s-box/sing-box version | awk '/^sing-box version / {print $3}' | cut -d '.' -f 1,2)
 }
 
 inscertificate(){
@@ -2377,22 +2380,31 @@ fi
 }
 
 cloudflaredargo(){
-if [ ! -e /etc/s-box/cloudflared ]; then
+if [[ -x /etc/s-box/cloudflared ]] && /etc/s-box/cloudflared --version >/dev/null 2>&1; then
+return 0
+fi
+local candidate
 case $(uname -m) in
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
+*) red "不支持的 cloudflared 架构"; return 1;;
 esac
-curl -L -o /etc/s-box/cloudflared -# --retry 2 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu
-#curl -L -o /etc/s-box/cloudflared -# --retry 2 https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/$cpu
-chmod +x /etc/s-box/cloudflared
+candidate=$(mktemp /etc/s-box/.cloudflared.XXXXXX) || return 1
+if ! curl --fail --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 \
+-o "$candidate" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu" ||
+! chmod 700 "$candidate" || ! "$candidate" --version >/dev/null 2>&1; then
+rm -f -- "$candidate"
+red "cloudflared 下载或检查失败，保留原文件和隧道"
+return 1
 fi
+mv -f -- "$candidate" /etc/s-box/cloudflared
 }
 
 cfargoym(){
 echo
 if [[ -f /etc/s-box/sbargotoken.log && -f /etc/s-box/sbargoym.log ]]; then
 green "当前Argo固定隧道域名：$(cat /etc/s-box/sbargoym.log 2>/dev/null)"
-green "当前Argo固定隧道Token：$(cat /etc/s-box/sbargotoken.log 2>/dev/null)"
+green "当前Argo固定隧道Token：已保存（不显示）"
 fi
 echo
 green "请进入Cloudflare官网 --- Zero Trust --- 网络 --- 连接器，创建固定隧道"
@@ -2401,9 +2413,12 @@ yellow "2：停止Argo固定隧道"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
-cloudflaredargo
-readp "输入Argo固定隧道Token: " argotoken
+cloudflaredargo || return 1
+read -r -s -p "输入Argo固定隧道Token: " argotoken; echo
 readp "输入Argo固定隧道域名: " argoym
+[[ "$argotoken" =~ ^[A-Za-z0-9_+/=-]{32,}$ && "$argoym" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || {
+red "Argo Token 或域名格式无效，保留现有隧道"; return 1;
+}
 vm_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
 echo
 yellow "注意！Zero Trust设置固定隧道URL端口填写Vmess端口：localhost:$vm_port"
@@ -2449,6 +2464,9 @@ fi
 fi
 echo ${argoym} > /etc/s-box/sbargoym.log
 echo ${argotoken} > /etc/s-box/sbargotoken.log
+chmod 600 /etc/s-box/sbargotoken.log
+[[ -f /etc/systemd/system/argo.service ]] && chmod 600 /etc/systemd/system/argo.service
+[[ -f /etc/init.d/argo ]] && chmod 700 /etc/init.d/argo
 argosh=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
 sbshare > /dev/null 2>&1
 blue "Argo固定隧道设置完成，固定域名：$argosh"
@@ -2478,7 +2496,7 @@ yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
 green "请稍等……"
-cloudflaredargo
+cloudflaredargo || return 1
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
 nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
 sleep 20
@@ -2545,6 +2563,7 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 green "五、自动生成warp-wireguard出站账户" && sleep 2
 warpwg
 inssbjsonser
+/etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1 || { red "配置检查失败，安装已停止"; return 1; }
 sbservice
 sbactive
 #curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
@@ -2880,10 +2899,100 @@ sb
 fi
 }
 
+sb_read_json(){
+python3 - "$1" <<'PYJSON'
+import json, re, sys
+try:
+    text = open(sys.argv[1]).read()
+    text = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/',
+                  lambda m: m[0] if m[0].startswith('"') else ' ', text)
+    json.loads(text)
+    print(text)
+except (OSError, ValueError):
+    sys.exit(1)
+PYJSON
+}
+
+sb_replace_config_string(){
+python3 - "$1" "$2" "$3" /etc/s-box/sing-box $sbfiles <<'PYEDIT'
+import json, os, pathlib, re, subprocess, sys, tempfile
+mode, old, new, core, *files = sys.argv[1:]
+string = r'"(?:\\.|[^"\\])*"'
+token = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|(?P<key>' + string + r')(?P<sep>\s*:\s*)(?P<value>' + string + r')|' + string)
+strip = re.compile(string + r'|//[^\n]*|/\*[\s\S]*?\*/')
+changes, staged, published = {}, {}, []
+def atomic(path, text):
+    fd, name = tempfile.mkstemp(prefix='.credentials-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+try:
+    if mode == 'uuid':
+        if not all(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', x) for x in (old, new)):
+            raise ValueError('uuid')
+        fields = {'uuid', 'password'}
+    elif mode == 'path':
+        # The legacy subscription writer still builds URI/VMess JSON by hand.
+        # Accept conventional URL path characters only, including percent escapes.
+        if not re.fullmatch(r'/[A-Za-z0-9/_.~%?&=:+-]*', new) or '//' in new:
+            raise ValueError('path')
+        fields = {'path'}
+    else:
+        raise ValueError('mode')
+    for filename in files:
+        path = pathlib.Path(filename)
+        if not path.exists(): continue
+        if path.is_symlink(): raise ValueError('symlink')
+        text = path.read_text()
+        matched = [0]
+        def replace(m):
+            if m.group('key') and json.loads(m.group('key')) in fields and json.loads(m.group('value')) == old:
+                matched[0] += 1
+                return m.group('key') + m.group('sep') + json.dumps(new, ensure_ascii=False)
+            return m[0]
+        candidate = token.sub(replace, text)
+        if not matched[0]: raise ValueError('no match')
+        json.loads(strip.sub(lambda m: m[0] if m[0].startswith('"') else ' ', candidate))
+        fd, name = tempfile.mkstemp(prefix='.credentials-check-', dir=path.parent)
+        with os.fdopen(fd, 'w') as f: f.write(candidate)
+        staged[path] = name
+        changes[path] = (text, candidate)
+    active = pathlib.Path(core).parent / 'sb.json'
+    if active not in staged: raise ValueError('missing active config')
+    subprocess.run([core, 'check', '-c', staged[active]], check=True, capture_output=True, timeout=30)
+    for path, (original, candidate) in changes.items():
+        atomic(pathlib.Path(str(path) + '.credentials.previous'), original)
+    for path in changes:
+        os.replace(staged[path], path)
+        published.append(path)
+except (OSError, ValueError, subprocess.SubprocessError):
+    for path in published: atomic(path, changes[path][0])
+    print('配置修改失败，已保留原配置；检查输入格式及配置匹配情况。', file=sys.stderr)
+    sys.exit(1)
+finally:
+    for name in staged.values():
+        if os.path.exists(name): os.unlink(name)
+PYEDIT
+}
+
+sb_restore_credentials(){
+local file
+for file in $sbfiles; do
+if [[ -f "$file.credentials.previous" ]]; then
+cp -p -- "$file.credentials.previous" "$file" || return 1
+fi
+done
+}
+
 changeuuid(){
 echo
-olduuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
-oldvmpath=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
+olduuid=$(sb_read_json /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
+oldvmpath=$(sb_read_json /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
 green "全协议的uuid (密码)：$olduuid"
 green "Vmess的path路径：$oldvmpath"
 echo
@@ -2898,20 +3007,28 @@ uuid=$(/etc/s-box/sing-box generate uuid)
 else
 uuid=$menu
 fi
-echo $sbfiles | xargs -n1 sed -i "s/$olduuid/$uuid/g"
-restartsb && sbshare > /dev/null 2>&1
+sb_replace_config_string uuid "$olduuid" "$uuid" || return 1
+if ! restartsb; then
+sb_restore_credentials && restartsb
+red "启动失败，已尝试恢复原凭据配置"; return 1
+fi
+sbshare > /dev/null 2>&1
 blue "已确认uuid (密码)：${uuid}" 
-blue "已确认Vmess的path路径：$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')"
+blue "已确认Vmess的path路径：$(sb_read_json /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')"
 elif [ "$menu" = "2" ]; then
 readp "输入Vmess的path路径，回车表示不变：" menu
 if [ -z "$menu" ]; then
 echo
 else
 vmpath=$menu
-echo $sbfiles | xargs -n1 sed -i "50s#$oldvmpath#$vmpath#g"
-restartsb && sbshare > /dev/null 2>&1
+sb_replace_config_string path "$oldvmpath" "$vmpath" || return 1
+if ! restartsb; then
+sb_restore_credentials && restartsb
+red "启动失败，已尝试恢复原路径配置"; return 1
 fi
-blue "已确认Vmess的path路径：$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')"
+sbshare > /dev/null 2>&1
+fi
+blue "已确认Vmess的path路径：$(sb_read_json /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')"
 else
 changeserv
 fi
@@ -2950,11 +3067,13 @@ yellow "1：重置/设置Telegram机器人的Token、用户ID"
 yellow "0：返回上层"
 readp "请选择【0-1】：" menu
 if [ "$menu" = "1" ]; then
-rm -rf /etc/s-box/sbtg.sh
-readp "输入Telegram机器人Token: " token
+read -r -s -p "输入Telegram机器人Token: " token; echo
 telegram_token=$token
 readp "输入Telegram机器人用户ID: " userid
 telegram_id=$userid
+[[ "$telegram_token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ && "$telegram_id" =~ ^-?[0-9]+$ ]] || {
+red "Telegram Token 或 ID 格式无效，保留现有配置"; return 1;
+}
 echo '#!/bin/bash
 export LANG=en_US.UTF-8
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
@@ -3053,6 +3172,7 @@ fi
 ' > /etc/s-box/sbtg.sh
 sed -i "s/telegram_token/$telegram_token/g" /etc/s-box/sbtg.sh
 sed -i "s/telegram_id/$telegram_id/g" /etc/s-box/sbtg.sh
+chmod 600 /etc/s-box/sbtg.sh
 green "设置完成！请确保TG机器人已处于激活状态！"
 tgnotice
 else
@@ -3099,17 +3219,35 @@ sb
 fi
 }
 
+sb_valid_subtoken(){
+[[ "$1" =~ ^[A-Za-z0-9_-]{16,128}$ ]]
+}
+
+sb_valid_port(){
+[[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 ipsub(){
 subtokenipsub(){
 echo
-readp "输入订阅链接路径密码（回车表示使用当前UUID）：" menu
+readp "输入订阅路径密码（16-128位字母数字_-，回车随机生成）：" menu
 if [ -z "$menu" ]; then
-subtoken="$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')"
+subtoken=$(openssl rand -hex 24) || return 1
 else
 subtoken="$menu"
 fi
-rm -rf /root/websbox/"$(cat /etc/s-box/subtoken.log 2>/dev/null)"
-echo $subtoken > /etc/s-box/subtoken.log
+sb_valid_subtoken "$subtoken" || { red "订阅路径格式无效，未修改文件"; return 1; }
+local oldtoken
+oldtoken=$(cat /etc/s-box/subtoken.log 2>/dev/null)
+if [[ -L /root/websbox ]]; then
+red "订阅根目录不能是符号链接，未删除任何文件"
+return 1
+fi
+if [[ -n "$oldtoken" ]]; then
+sb_valid_subtoken "$oldtoken" || { red "旧订阅路径异常，未删除任何目录"; return 1; }
+rm -rf -- "/root/websbox/$oldtoken" || return 1
+fi
+printf '%s\n' "$subtoken" > /etc/s-box/subtoken.log
 green "订阅链接路径密码：$(cat /etc/s-box/subtoken.log 2>/dev/null)"
 }
 subportipsub(){
@@ -3120,7 +3258,8 @@ subport=$(shuf -i 10000-65535 -n 1)
 else
 subport="$menu"
 fi
-echo $subport > /etc/s-box/subport.log
+sb_valid_port "$subport" || { red "订阅端口必须在 1-65535 范围内"; return 1; }
+printf '%s\n' "$subport" > /etc/s-box/subport.log
 green "订阅链接端口：$(cat /etc/s-box/subport.log 2>/dev/null)"
 }
 echo
@@ -3131,11 +3270,11 @@ yellow "4：卸载本地IP订阅链接"
 yellow "0：返回上层"
 readp "请选择【0-4】：" menu
 if [ "$menu" = "1" ]; then
-subtokenipsub && subportipsub
+subtokenipsub && subportipsub || return 1
 elif [ "$menu" = "2" ];then
-subtokenipsub
+subtokenipsub || return 1
 elif [ "$menu" = "3" ];then
-subportipsub
+subportipsub || return 1
 elif [ "$menu" = "4" ];then
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
 crontab -l 2>/dev/null > /tmp/crontab.tmp
@@ -3148,6 +3287,10 @@ green "本地IP订阅链接已卸载完成" && sleep 3 && exit
 else
 changeserv
 fi
+sb_valid_subtoken "$(cat /etc/s-box/subtoken.log 2>/dev/null)" &&
+sb_valid_port "$(cat /etc/s-box/subport.log 2>/dev/null)" && [[ ! -L /root/websbox ]] || {
+red "订阅参数或根目录无效，未启动 HTTP 服务"; return 1;
+}
 echo
 green "请稍后…………"
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
@@ -3222,84 +3365,94 @@ changeserv
 fi
 }
 
+sb_gitlab_push(){
+(
+cd /etc/s-box || exit 1
+local branch
+branch=$(cat gitlab-branch 2>/dev/null)
+[[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] && git check-ref-format --branch "$branch" >/dev/null 2>&1 || {
+red "GitLab 分支无效，请重新设置订阅"; exit 1;
+}
+[[ -f gitlabtoken.txt && -x git-askpass.sh ]] || { red "请重新设置 GitLab 认证"; exit 1; }
+# Never execute the historical expect script, force-push, or commit unrelated staged files.
+git add -- sbox.json clmi.yaml jhsub.txt || exit 1
+if ! git diff --cached --quiet -- sbox.json clmi.yaml jhsub.txt; then
+git commit --only -m "Update subscriptions" -- sbox.json clmi.yaml jhsub.txt >/dev/null || exit 1
+fi
+GIT_ASKPASS=/etc/s-box/git-askpass.sh GIT_TERMINAL_PROMPT=0 \
+git -c credential.helper= push origin "HEAD:refs/heads/$branch" >/dev/null 2>&1 || {
+red "GitLab 推送失败（认证、网络或远端分支冲突）；未强制覆盖远端。"; exit 1;
+}
+)
+}
+
 gitlabsub(){
 echo
-green "请确保Gitlab官网上已建立项目，已开启推送功能，已获取访问令牌"
-yellow "1：重置/设置Gitlab订阅链接"
+yellow "1：设置 GitLab 订阅（推送令牌与只读订阅令牌分开）"
 yellow "0：返回上层"
 readp "请选择【0-1】：" menu
-if [ "$menu" = "1" ]; then
-cd /etc/s-box
+[[ "$menu" == "1" ]] || { changeserv; return; }
+local email token userid project gitlabml readtoken
 readp "输入登录邮箱: " email
-readp "输入访问令牌: " token
-readp "输入用户名: " userid
+read -r -s -p "输入推送令牌: " token; echo
+readp "输入用户名/命名空间: " userid
 readp "输入项目名: " project
-echo
-green "多台VPS共用一个令牌及项目名，可创建多个分支订阅链接"
-green "回车跳过表示不新建，仅使用主分支main订阅链接(首台VPS建议回车跳过)"
-readp "新建分支名称: " gitlabml
-echo
-if [[ -z "$gitlabml" ]]; then
-gitlab_ml=''
-git_sk=main
-rm -rf /etc/s-box/gitlab_ml_ml
+readp "输入分支名（回车 main）: " gitlabml
+gitlabml=${gitlabml:-main}
+[[ "$token" =~ ^[A-Za-z0-9_.-]+$ && "$userid" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*$ &&
+"$project" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ && "$gitlabml" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+git check-ref-format --branch "$gitlabml" >/dev/null 2>&1 || { red "输入格式无效，未修改仓库"; return 1; }
+read -r -s -p "私有仓库请输入独立的只读订阅令牌（公开仓库回车）: " readtoken; echo
+if [[ -n "$readtoken" && ( ! "$readtoken" =~ ^[A-Za-z0-9_.-]+$ || "$readtoken" == "$token" ) ]]; then
+red "订阅令牌必须与推送令牌不同，并使用只读权限"; return 1
+fi
+(
+cd /etc/s-box || exit 1
+[[ -f sbox.json && -f clmi.yaml && -f jhsub.txt ]] || { red "请先生成本地订阅文件"; exit 1; }
+# Retain history; remote non-fast-forward errors require reconciliation, never deletion.
+if [[ ! -d .git ]]; then
+git init >/dev/null 2>&1 || exit 1
+fi
+git config user.email "$email" && git config user.name "$userid" || exit 1
+if git remote get-url origin >/dev/null 2>&1; then
+git remote set-url origin "https://gitlab.com/$userid/$project.git" || exit 1
 else
-gitlab_ml=":${gitlabml}"
-git_sk="${gitlabml}"
-echo "${gitlab_ml}" > /etc/s-box/gitlab_ml_ml
+git remote add origin "https://gitlab.com/$userid/$project.git" || exit 1
 fi
-echo "$token" > /etc/s-box/gitlabtoken.txt
-rm -rf /etc/s-box/.git
-git init >/dev/null 2>&1
-git add sbox.json clmi.yaml jhsub.txt >/dev/null 2>&1
-git config --global user.email "${email}" >/dev/null 2>&1
-git config --global user.name "${userid}" >/dev/null 2>&1
-git commit -m "commit_add_$(date +"%F %T")" >/dev/null 2>&1
-branches=$(git branch)
-if [[ $branches == *master* ]]; then
-git branch -m master main >/dev/null 2>&1
-fi
-git remote add origin https://${token}@gitlab.com/${userid}/${project}.git >/dev/null 2>&1
-if [[ $(ls -a | grep '^\.git$') ]]; then
-cat > /etc/s-box/gitpush.sh <<EOF
-#!/usr/bin/expect
-spawn bash -c "git push -f origin main${gitlab_ml}"
-expect "Password for 'https://$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)@gitlab.com':"
-send "$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)\r"
-interact
-EOF
-chmod +x gitpush.sh
-./gitpush.sh "git push -f origin main${gitlab_ml}" cat /etc/s-box/gitlabtoken.txt >/dev/null 2>&1
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/sbox.json/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/sing_box_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/clmi.yaml/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/clash_meta_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/jhsub.txt/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/jh_sub_gitlab.txt
+printf '%s\n' "$token" > gitlabtoken.txt
+chmod 600 gitlabtoken.txt
+printf '%s\n' "$gitlabml" > gitlab-branch
+cat > git-askpass.sh <<'ASKPASS'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' oauth2 ;;
+*Password*) cat /etc/s-box/gitlabtoken.txt ;;
+*) exit 1 ;;
+esac
+ASKPASS
+chmod 700 git-askpass.sh
+rm -f -- gitpush.sh
+sb_gitlab_push || exit 1
+# Quote namespace and branch as URL components without putting the push token into URLs.
+local project_id branch_ref query
+project_id=$(jq -rn --arg value "$userid/$project" '$value|@uri')
+branch_ref=$(jq -rn --arg value "$gitlabml" '$value|@uri')
+query="ref=$branch_ref"
+[[ -n "$readtoken" ]] && query="$query&private_token=$readtoken"
+printf '%s\n' "https://gitlab.com/api/v4/projects/$project_id/repository/files/sbox.json/raw?$query" > sing_box_gitlab.txt
+printf '%s\n' "https://gitlab.com/api/v4/projects/$project_id/repository/files/clmi.yaml/raw?$query" > clash_meta_gitlab.txt
+printf '%s\n' "https://gitlab.com/api/v4/projects/$project_id/repository/files/jhsub.txt/raw?$query" > jh_sub_gitlab.txt
+chmod 600 sing_box_gitlab.txt clash_meta_gitlab.txt jh_sub_gitlab.txt
+) || return 1
 clsbshow
-else
-yellow "设置Gitlab订阅链接失败，请反馈"
-fi
-cd
-else
-changeserv
-fi
 }
 
 gitlabsubgo(){
-cd /etc/s-box
-if [[ $(ls -a | grep '^\.git$') ]]; then
-if [ -f /etc/s-box/gitlab_ml_ml ]; then
-gitlab_ml=$(cat /etc/s-box/gitlab_ml_ml)
-fi
-git rm --cached sbox.json clmi.yaml jhsub.txt >/dev/null 2>&1
-git commit -m "commit_rm_$(date +"%F %T")" >/dev/null 2>&1
-git add sbox.json clmi.yaml jhsub.txt >/dev/null 2>&1
-git commit -m "commit_add_$(date +"%F %T")" >/dev/null 2>&1
-chmod +x gitpush.sh
-./gitpush.sh "git push -f origin main${gitlab_ml}" cat /etc/s-box/gitlabtoken.txt >/dev/null 2>&1
+if sb_gitlab_push; then
 clsbshow
 else
-yellow "未设置Gitlab订阅链接"
+return 1
 fi
-cd
 }
 
 clsbshow(){
@@ -3783,12 +3936,23 @@ fi
 }
 
 restartsb(){
+if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+red "配置检查失败，未重启服务。请检查配置（诊断可能包含凭据）。"
+return 1
+fi
 if command -v apk >/dev/null 2>&1; then
-rc-service sing-box restart
+rc-service sing-box restart || return 1
+sleep 2
+rc-service sing-box status >/dev/null 2>&1
 else
-systemctl enable sing-box
-systemctl start sing-box
-systemctl restart sing-box
+local pid attempt
+systemctl restart sing-box || return 1
+pid=$(systemctl show --property=MainPID --value sing-box)
+[[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+for attempt in 1 2 3; do
+sleep 1
+systemctl is-active --quiet sing-box && [[ "$(systemctl show --property=MainPID --value sing-box)" == "$pid" ]] || return 1
+done
 fi
 }
 
@@ -3832,18 +3996,22 @@ rm /tmp/crontab.tmp
 }
 
 lnsb(){
-rm -rf /usr/bin/sb
-curl -L -o /usr/bin/sb -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh
-chmod +x /usr/bin/sb
+local candidate
+if [[ ! -f "$SB_SCRIPT_SOURCE" || "$SB_SCRIPT_SOURCE" == /proc/* || "$SB_SCRIPT_SOURCE" == /dev/* ]]; then
+red "请先将仓库克隆或脚本下载到普通文件，再运行；快捷命令只安装本地已审阅脚本。"
+return 1
+fi
+[[ "$SB_SCRIPT_SOURCE" == /usr/bin/sb ]] && return 0
+candidate=$(mktemp /usr/bin/.sb.XXXXXX) || return 1
+if ! cp -- "$SB_SCRIPT_SOURCE" "$candidate" || ! bash -n "$candidate" || ! chmod 700 "$candidate"; then
+rm -f -- "$candidate"
+return 1
+fi
+mv -f -- "$candidate" /usr/bin/sb
 }
 
 upsbyg(){
-if [[ ! -f '/usr/bin/sb' ]]; then
-red "未正常安装Sing-box-yg" && exit
-fi
-lnsb
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
-green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
+yellow "自动覆盖脚本已停用。请在自己的 Git 仓库获取并审阅更新，再从该仓库运行 sb.sh。"
 }
 
 lapre(){
@@ -3883,29 +4051,25 @@ sb
 fi
 if [[ -n $upcore ]]; then
 green "开始下载并更新Sing-box内核……请稍等"
-sbname="sing-box-$upcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$upcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-mv /etc/s-box/$sbname/sing-box /etc/s-box
-rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-if [[ -f '/etc/s-box/sing-box' ]]; then
-chown root:root /etc/s-box/sing-box
-chmod +x /etc/s-box/sing-box
-sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-[[ "$sbnh" == "1.10" ]] && num=10 || num=11
-rm -rf /etc/s-box/sb.json
-cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
-restartsb && sbshare > /dev/null 2>&1
-blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sb
-else
-red "下载 Sing-box 内核不完整，安装失败，请重试" && upsbcroe
+if ! fetch_sbcore "$upcore"; then
+red "下载或兼容性检查失败，保留原内核和配置"
+return 1
 fi
-else
-red "下载 Sing-box 内核失败或不存在，请重试" && upsbcroe
+sbnh=$(/etc/s-box/sing-box version | awk '/^sing-box version / {print $3}' | cut -d '.' -f 1,2)
+# Keep the active configuration; never replace user edits with a stale template.
+if ! restartsb; then
+if [[ -f /etc/s-box/sing-box.previous ]]; then
+mv -f /etc/s-box/sing-box.previous /etc/s-box/sing-box
+restartsb
 fi
+red "新内核启动失败，已尝试恢复旧内核"
+return 1
+fi
+sbshare >/dev/null 2>&1
+blue "内核更新完成：$upcore"
 else
-red "版本号检测出错，请重试" && upsbcroe
+red "版本号检测出错"
+return 1
 fi
 }
 
@@ -4161,8 +4325,8 @@ case $(uname -m) in
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 esac
-curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sbwpph_$cpu
-chmod +x /etc/s-box/sbwpph
+yellow "未审计的辅助二进制自动下载已停用；此功能不属于链式代理部署。"
+return 1
 fi
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 v4v6
@@ -4226,7 +4390,7 @@ yellow "3：停止WARP-plus-Socks5代理模式"
 yellow "0：返回上层"
 readp "请选择【0-3】：" menu
 if [ "$menu" = "1" ]; then
-ins
+ins || return 1
 nohup /etc/s-box/sbwpph -b 127.0.0.1:$port -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 &
 green "申请IP中……请稍等……" && sleep 20
 resv1=$(curl -sm3 --socks5 localhost:$port icanhazip.com)
@@ -4239,7 +4403,7 @@ aplws5
 green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
 fi
 elif [ "$menu" = "2" ]; then
-ins
+ins || return 1
 echo '
 奥地利（AT）
 澳大利亚（AU）

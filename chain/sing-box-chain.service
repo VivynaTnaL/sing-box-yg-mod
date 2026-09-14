@@ -1,0 +1,29 @@
+[Unit]
+Description=Two-server sing-box chain
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=config.json:/etc/sing-box-chain/config.json
+ExecStart=/opt/sing-box-chain/sing-box run -c %d/config.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
