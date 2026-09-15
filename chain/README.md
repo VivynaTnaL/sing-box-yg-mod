@@ -1,5 +1,7 @@
 # 实用版 v1：A 直出 / B 直出 / A→B
 
+> 本文描述旧版的原端口接管模式。新安装请使用 [独立附件](ADDON.md)，入口为仓库根目录 `bash sb-chain`。新版与原服务并行；已使用本页部署的机器可通过新版的“恢复旧接管版的原服务”菜单迁移。旧生成和部署命令保留以便维护历史安装。
+
 本工具复用原脚本已经可用的客户端接入方式，新增私有 SS2022 服务器间连接。代理数据全部由 sing-box 处理；Python 负责参数、聚合文件、校验和部署。
 
 | 聚合组 | 客户端入口 | 最终出口 | 在哪里生成 |
@@ -163,6 +165,37 @@ python3 chain/chain.py update-link --binary /tmp/sing-box-chain-core \
 在 B 上用 `rotate-link --binary /tmp/sing-box-chain-core --spec /root/chain-state/B.json` 生成新 SS 密钥，build 后把新的 B-link.json 交给 A，再用上面的 update-link。两个客户端直连组与 A 链式客户端凭据都保持不变。
 
 这些修改命令在验证成功后保存 `.previous` 参数备份。SS 密钥轮换需协调 B 与 A，会有切换窗口；当前没有双密钥无缝轮换。SS2022 提供 AEAD 加密与重放防护，**不提供前向保密**。原分享链接的 TLS 参数按原样继承，原来跳过证书验证的链接不会在导入时自动变安全，需在源接入配置中修复。
+
+## 导入 Clash / Mihomo 客户端
+
+独立工具 `chain/export_clash.py` 离线读取逐行节点链接或 Base64 聚合文件，输出完整的 Mihomo YAML 配置。不需要重新初始化、build 或重启服务，也不需要第三方订阅转换网站。Python 3.9+，仅使用标准库。支持本项目五种协议，保留 Reality、VMess WebSocket 的 CDN/Argo 地址与 Host/SNI、TLS 验证设置、HY2 证书指纹和端口跳跃；遇到尚未支持的参数会停止，不静默丢弃。
+
+在 A 上合并单 A 与 A → B 两组（路径换成实际已部署的发布目录）：
+
+```bash
+python3 chain/export_clash.py \
+  --input /root/chain-state/A-release-1/A-direct.txt \
+  --input /root/chain-state/A-release-1/A-to-B.txt \
+  --output /root/chain-state/A-clash.yaml
+```
+
+在 B 上导出单 B：
+
+```bash
+python3 chain/export_clash.py \
+  --input /root/chain-state/B-release-1/B-direct.txt \
+  --output /root/chain-state/B-clash.yaml
+```
+
+每个 `--input` 对应一个手动选择组。只给一个文件就是单组配置；要把三组放到同一份配置中，通过 SSH/SFTP 把 `B-direct.txt` 安全复制到运行导出工具的机器，再追加一个 `--input /实际路径/B-direct.txt`。不要把服务器间专用的 `B-link.json` 当作客户端输入。Base64 文件可直接代替相应 `.txt` 文件。输出文件必须尚不存在，更新时使用新文件名。
+
+将生成的 `.yaml` 通过 SFTP/SCP 下载到用户设备，在客户端的配置/订阅页面选择「从文件导入」（具体名称随客户端不同），启用配置，然后在「代理选择」中选择组，在对应组中选择节点，开启系统代理或按客户端设置启用 TUN。A → B 由 A 上的 sing-box 路由承担，客户端无需配置 relay 或 dialer-proxy。
+
+目标是支持这五种协议的 **Mihomo 内核**，不是所有历史 Clash 内核；例如旧 Clash 不具备完整的 AnyTLS 支持。导出工具现在默认使用国内与局域网直连、其他流量代理的规则及 DNS 策略；通过 `--routing lan-direct` 仅绕过局域网，或 `--routing global` 使用全部代理。`--rules-dir` 可指定 GeoIP/GeoSite 导入快照，规则将内嵌到 YAML；未提供时国内规则使用远程规则集。支持重复的 `--direct-domain` / `--proxy-domain` / `--direct-cidr` / `--proxy-cidr` 例外。DIRECT 表示客户端设备直连，与 A-direct 节点组不同。文件本身不启用 TUN，也不会自动成为订阅 URL；完整的规则导入和 URL 发布见 [独立附件说明](ADDON.md)。
+
+输出权限为 0600，包含节点凭据，请勿提交到 Git。源节点原本跳过证书验证时导出会保留该设置。转换只改变客户端配置格式，不代表已验证真实公网连通性。
+
+格式依据：[Mihomo VLESS](https://wiki.metacubex.one/config/proxies/vless/)、[VMess](https://wiki.metacubex.one/config/proxies/vmess/)、[Hysteria2](https://wiki.metacubex.one/config/proxies/hysteria2/)、[TUIC](https://wiki.metacubex.one/config/proxies/tuic/)、[AnyTLS](https://wiki.metacubex.one/config/proxies/anytls/)。
 
 ## 验收与测试
 

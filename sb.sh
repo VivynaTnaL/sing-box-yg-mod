@@ -1,11 +1,44 @@
 #!/bin/bash
+# Resolve companion modules before any legacy environment or service action.
+SB_SCRIPT_SOURCE=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+SB_MODULE_ROOT=$(dirname -- "$SB_SCRIPT_SOURCE")
+if [[ ! -f "$SB_MODULE_ROOT/chain/generate.py" && "$SB_SCRIPT_SOURCE" == /usr/bin/sb ]]; then
+    SB_MODULE_ROOT=/usr/local/lib/sing-box-yg
+fi
+for SB_REQUIRED_MODULE in chain/generate.py chain/chain.py chain/fetch-core.py chain/core.lock.json; do
+    if [[ ! -f "$SB_MODULE_ROOT/$SB_REQUIRED_MODULE" ]]; then
+        echo "缺少完整仓库模块：$SB_REQUIRED_MODULE。请从本地完整仓库运行 sb.sh。" >&2
+        exit 1
+    fi
+done
+if [[ ${1-} == --generate-config ]]; then
+    shift
+    if [[ ! -f "$SB_MODULE_ROOT/chain/generate.py" ]]; then
+        echo "缺少完整仓库的生成模块。请从本地完整仓库运行，安装快捷命令时会同时安装模块。" >&2
+        exit 1
+    fi
+    exec python3 "$SB_MODULE_ROOT/chain/generate.py" "$@"
+fi
+for SB_REQUIRED_MODULE in lib/sb-config.sh lib/sb-install.sh; do
+    if [[ ! -f "$SB_MODULE_ROOT/$SB_REQUIRED_MODULE" ]]; then
+        echo "缺少本地模块：$SB_REQUIRED_MODULE；请从完整仓库运行 sb.sh。" >&2
+        exit 1
+    fi
+done
+source "$SB_MODULE_ROOT/lib/sb-config.sh" || exit 1
+source "$SB_MODULE_ROOT/lib/sb-install.sh" || exit 1
+if [[ ${1-} == --install-shortcut ]]; then
+    [[ $# == 1 ]] || { echo "--install-shortcut 不接受其他参数" >&2; exit 1; }
+    [[ $EUID == 0 ]] || { echo "安装系统快捷命令需要 root；只生成配置不需要。" >&2; exit 1; }
+    sb_install_local_shortcut || exit 1
+    echo "已从本地安装 sb 快捷命令及配套模块。"
+    exit 0
+fi
 if [[ -e /etc/sing-box-chain/legacy-managed ]]; then
     echo "本机代理已由 chain/ 工具接管。请使用该工具更新配置，避免旧菜单覆盖端口、凭据或服务。"
     exit 1
 fi
 export LANG=en_US.UTF-8
-# Keep the reviewed local script when installing the shortcut.
-SB_SCRIPT_SOURCE=$(readlink -f -- "${BASH_SOURCE[0]}")
 umask 077
 red='\033[0;31m'
 green='\033[0;32m'
@@ -423,460 +456,9 @@ blue "已确认Vmess的path路径：${uuid}-vm"
 }
 
 inssbjsonser(){
-cat > /etc/s-box/sb10.json <<EOF
-{
-"log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "sniff": true,
-      "sniff_override_destination": true,
-      "tag": "vless-sb",
-      "listen": "::",
-      "listen_port": ${port_vl_re},
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${ym_vl_re}",
-          "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${ym_vl_re}",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": ["$short_id"]
-        }
-      }
-    },
-{
-        "type": "vmess",
-        "sniff": true,
-        "sniff_override_destination": true,
-        "tag": "vmess-sb",
-        "listen": "::",
-        "listen_port": ${port_vm_ws},
-        "users": [
-            {
-                "uuid": "${uuid}",
-                "alterId": 0
-            }
-        ],
-        "transport": {
-            "type": "ws",
-            "path": "${uuid}-vm",
-            "max_early_data":2048,
-            "early_data_header_name": "Sec-WebSocket-Protocol"    
-        },
-        "tls":{
-                "enabled": ${tlsyn},
-                "server_name": "${ym_vm_ws}",
-                "certificate_path": "$certificatec_vmess_ws",
-                "key_path": "$certificatep_vmess_ws"
-            }
-    }, 
-    {
-        "type": "hysteria2",
-        "sniff": true,
-        "sniff_override_destination": true,
-        "tag": "hy2-sb",
-        "listen": "::",
-        "listen_port": ${port_hy2},
-        "users": [
-            {
-                "password": "${uuid}"
-            }
-        ],
-        "ignore_client_bandwidth":false,
-        "tls": {
-            "enabled": true,
-            "alpn": [
-                "h3"
-            ],
-            "certificate_path": "$certificatec_hy2",
-            "key_path": "$certificatep_hy2"
-        }
-    },
-        {
-            "type":"tuic",
-            "sniff": true,
-            "sniff_override_destination": true,
-            "tag": "tuic5-sb",
-            "listen": "::",
-            "listen_port": ${port_tu},
-            "users": [
-                {
-                    "uuid": "${uuid}",
-                    "password": "${uuid}"
-                }
-            ],
-            "congestion_control": "bbr",
-            "tls":{
-                "enabled": true,
-                "alpn": [
-                    "h3"
-                ],
-                "certificate_path": "$certificatec_tuic",
-                "key_path": "$certificatep_tuic"
-            }
-        }
-],
-"outbounds": [
-{
-"type":"direct",
-"tag":"direct",
-"domain_strategy": "$ipv"
-},
-{
-"type":"direct",
-"tag": "vps-outbound-v4", 
-"domain_strategy":"prefer_ipv4"
-},
-{
-"type":"direct",
-"tag": "vps-outbound-v6",
-"domain_strategy":"prefer_ipv6"
-},
-{
-"type": "socks",
-"tag": "socks-out",
-"server": "127.0.0.1",
-"server_port": 40000,
-"version": "5"
-},
-{
-"type":"direct",
-"tag":"socks-IPv4-out",
-"detour":"socks-out",
-"domain_strategy":"prefer_ipv4"
-},
-{
-"type":"direct",
-"tag":"socks-IPv6-out",
-"detour":"socks-out",
-"domain_strategy":"prefer_ipv6"
-},
-{
-"type":"direct",
-"tag":"warp-IPv4-out",
-"detour":"wireguard-out",
-"domain_strategy":"prefer_ipv4"
-},
-{
-"type":"direct",
-"tag":"warp-IPv6-out",
-"detour":"wireguard-out",
-"domain_strategy":"prefer_ipv6"
-},
-{
-"type":"wireguard",
-"tag":"wireguard-out",
-"server":"$endip",
-"server_port":2408,
-"local_address":[
-"172.16.0.2/32",
-"${v6}/128"
-],
-"private_key":"$pvk",
-"peer_public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-"reserved":$res
-},
-{
-"type": "block",
-"tag": "block"
-}
-],
-"route":{
-"rules":[
-{
-"protocol": [
-"quic",
-"stun"
-],
-"outbound": "block"
-},
-{
-"outbound":"warp-IPv4-out",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound":"warp-IPv6-out",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound":"socks-IPv4-out",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound":"socks-IPv6-out",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound":"vps-outbound-v4",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound":"vps-outbound-v6",
-"domain_suffix": [
-"yg_kkk"
-]
-,"geosite": [
-"yg_kkk"
-]
-},
-{
-"outbound": "direct",
-"network": "udp,tcp"
-}
-]
-}
-}
-EOF
-
-cat > /etc/s-box/sb11.json <<EOF
-{
-"log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-
-      
-      "tag": "vless-sb",
-      "listen": "::",
-      "listen_port": ${port_vl_re},
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${ym_vl_re}",
-          "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${ym_vl_re}",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": ["$short_id"]
-        }
-      }
-    },
-{
-        "type": "vmess",
-
- 
-        "tag": "vmess-sb",
-        "listen": "::",
-        "listen_port": ${port_vm_ws},
-        "users": [
-            {
-                "uuid": "${uuid}",
-                "alterId": 0
-            }
-        ],
-        "transport": {
-            "type": "ws",
-            "path": "${uuid}-vm",
-            "max_early_data":2048,
-            "early_data_header_name": "Sec-WebSocket-Protocol"    
-        },
-        "tls":{
-                "enabled": ${tlsyn},
-                "server_name": "${ym_vm_ws}",
-                "certificate_path": "$certificatec_vmess_ws",
-                "key_path": "$certificatep_vmess_ws"
-            }
-    }, 
-    {
-        "type": "hysteria2",
-
- 
-        "tag": "hy2-sb",
-        "listen": "::",
-        "listen_port": ${port_hy2},
-        "users": [
-            {
-                "password": "${uuid}"
-            }
-        ],
-        "ignore_client_bandwidth":false,
-        "tls": {
-            "enabled": true,
-            "alpn": [
-                "h3"
-            ],
-            "certificate_path": "$certificatec_hy2",
-            "key_path": "$certificatep_hy2"
-        }
-    },
-        {
-            "type":"tuic",
-
-     
-            "tag": "tuic5-sb",
-            "listen": "::",
-            "listen_port": ${port_tu},
-            "users": [
-                {
-                    "uuid": "${uuid}",
-                    "password": "${uuid}"
-                }
-            ],
-            "congestion_control": "bbr",
-            "tls":{
-                "enabled": true,
-                "alpn": [
-                    "h3"
-                ],
-                "certificate_path": "$certificatec_tuic",
-                "key_path": "$certificatep_tuic"
-            }
-        },
-        {
-            "type":"anytls",
-            "tag":"anytls-sb",
-            "listen":"::",
-            "listen_port":${port_an},
-            "users":[
-                {
-                  "password":"${uuid}"
-                }
-            ],
-            "padding_scheme":[],
-            "tls":{
-                "enabled": true,
-                "certificate_path": "$certificatec_an",
-                "key_path": "$certificatep_an"
-            }
-        }
-],
-"endpoints":[
-{
-"type":"wireguard",
-"tag":"warp-out",
-"address":[
-"172.16.0.2/32",
-"${v6}/128"
-],
-"private_key":"$pvk",
-"peers": [
-{
-"address": "$endip",
-"port":2408,
-"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-"allowed_ips": [
-"0.0.0.0/0",
-"::/0"
-],
-"reserved":$res
-}
-]
-}
-],
-
-
-
-
-
-
-
-
-
-"outbounds": [
-{
-"type":"direct",
-"tag":"direct"
-},
-{
-"type": "socks",
-"tag": "socks-out",
-"server": "127.0.0.1",
-"server_port": 40000,
-"version": "5"
-}
-],
-"route":{
-"rules":[
-{
- "action": "sniff"
-},
-{
-"action": "resolve",
-"domain_suffix":[
-"yg_kkk"
-],
-"strategy": "prefer_ipv4"
-},
-{
-"action": "resolve",
-"domain_suffix":[
-"yg_kkk"
-],
-"strategy": "prefer_ipv6"
-},
-{
-"domain_suffix":[
-"yg_kkk"
-],
-"outbound":"socks-out"
-},
-{
-"domain_suffix":[
-"yg_kkk"
-],
-"outbound":"warp-out"
-},
-{
-"outbound": "direct",
-"network": "udp,tcp"
-}
-]
-}
-}
-EOF
-[[ "$sbnh" == "1.10" ]] && num=10 || num=11
-cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
+# The renderer only writes files in the requested directory. Service deployment
+# happens separately in sb_deploy_generated after the selected core checks it.
+sb_render_legacy_config "${1:-/etc/s-box}" "$sbnh"
 }
 
 sbservice(){
@@ -2539,10 +2121,9 @@ cfargo_ym
 fi
 }
 
-instsllsingbox(){
-if [[ -f '/etc/systemd/system/sing-box.service' ]]; then
-red "已安装Sing-box服务，无法再次安装" && exit
-fi
+sb_prepare_legacy_install(){
+# Legacy environment setup retains upstream certificate/network prompts.
+# It is deliberately separate from the pure file generator.
 mkdir -p /etc/s-box
 v6
 openyn
@@ -2562,14 +2143,24 @@ wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "五、自动生成warp-wireguard出站账户" && sleep 2
 warpwg
-inssbjsonser
-/etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1 || { red "配置检查失败，安装已停止"; return 1; }
-sbservice
-sbactive
+}
+
+sb_deploy_generated(){
+local generated=${1:?需要已生成的配置目录} config_name
+/etc/s-box/sing-box check -c "$generated/sb.json" >/dev/null 2>&1 || {
+    red "配置检查失败，未部署服务"; return 1;
+}
+for config_name in sb10.json sb11.json sb.json; do
+    install -m 600 -- "$generated/$config_name" "/etc/s-box/$config_name" || return 1
+done
+sbservice || return 1
+sbactive || return 1
 #curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
+lnsb || return 1
+blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb"
+cronsb || return 1
 echo
 wgcfgo
 sbshare
@@ -2577,6 +2168,23 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 blue "可选择9，刷新并显示所有协议配置及分享链接"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
+}
+
+instsllsingbox(){
+if [[ -f '/etc/systemd/system/sing-box.service' ]]; then
+    red "已安装Sing-box服务，无法再次安装"; return 1
+fi
+sb_prepare_legacy_install || return 1
+local generated result
+generated=$(mktemp -d /etc/s-box/.generated.XXXXXX) || return 1
+if inssbjsonser "$generated"; then
+    sb_deploy_generated "$generated"
+    result=$?
+else
+    result=1
+fi
+rm -rf -- "$generated"
+return "$result"
 }
 
 changeym(){
@@ -3996,18 +3604,7 @@ rm /tmp/crontab.tmp
 }
 
 lnsb(){
-local candidate
-if [[ ! -f "$SB_SCRIPT_SOURCE" || "$SB_SCRIPT_SOURCE" == /proc/* || "$SB_SCRIPT_SOURCE" == /dev/* ]]; then
-red "请先将仓库克隆或脚本下载到普通文件，再运行；快捷命令只安装本地已审阅脚本。"
-return 1
-fi
-[[ "$SB_SCRIPT_SOURCE" == /usr/bin/sb ]] && return 0
-candidate=$(mktemp /usr/bin/.sb.XXXXXX) || return 1
-if ! cp -- "$SB_SCRIPT_SOURCE" "$candidate" || ! bash -n "$candidate" || ! chmod 700 "$candidate"; then
-rm -f -- "$candidate"
-return 1
-fi
-mv -f -- "$candidate" /usr/bin/sb
+sb_install_local_shortcut
 }
 
 upsbyg(){
@@ -4091,6 +3688,9 @@ ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
 rm -rf /etc/s-box sbyg_update /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
+if [[ ! -L /usr/local/lib/sing-box-yg && -f /usr/local/lib/sing-box-yg/.local-sb-modules ]]; then
+    rm -rf -- /usr/local/lib/sing-box-yg
+fi
 rm -f /etc/local.d/alpineargo.start /etc/local.d/alpinesub.start /etc/local.d/alpinews5.start
 uncronsb
 iptables -t nat -F PREROUTING >/dev/null 2>&1

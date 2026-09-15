@@ -1,0 +1,3 @@
+# This extracted heredoc preserves the original configuration bytes, including
+# line-ending spaces. Its compatibility test verifies the complete output hash.
+lib/sb-config.sh whitespace=-blank-at-eol

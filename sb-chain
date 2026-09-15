@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec python3 "$SCRIPT_DIR/chain/addon.py" "$@"
