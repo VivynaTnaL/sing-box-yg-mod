@@ -65,6 +65,31 @@ def refresh_clients(store, state=None):
     return Path(release) if active else None
 
 
+def publish_clients(store):
+    """Apply direct client groups while keeping the running chain and its policy."""
+    from addon import build
+    from publish import Publisher
+    desired = store.read()
+    active = store.read('active.json', optional=True)
+    if not active:
+        raise ConfigError('请先部署附件，再应用客户端节点组')
+    updated = copy.deepcopy(active['state'])
+    for group in ('A-direct', 'B-direct'):
+        if group in desired.get('groups', {}):
+            updated['groups'][group] = copy.deepcopy(desired['groups'][group])
+        else:
+            updated['groups'].pop(group, None)
+    updated = ensure(store, updated)
+    release = build(store, updated)
+    publication = store.read('publication.json', optional=True)
+    publisher = Publisher(publication['root']) if publication else None
+    with store.transaction('active.json'), publisher.transaction() if publisher else nullcontext():
+        if publisher:
+            publisher.publish(release)
+        store.save({'release': str(release), 'state': updated}, 'active.json')
+    return release
+
+
 def update_rules(store, geoip=None, geosite=None, binary=None, force=False, scheduled=False):
     from addon import build
     from publish import Publisher

@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 
 FILES = ("mihomo.yaml", "sing-box.json", "nodes.txt", "nodes.base64.txt")
+GROUPS = ("A-direct", "B-direct", "A-to-B")
 ROOT = Path("/var/lib/sing-box-addon-sub")
 SERVICE = "sing-box-addon-sub.service"
 MAX_FILE_BYTES = 32 * 1024 * 1024
@@ -67,6 +68,30 @@ def _read_at(directory, name):
         if len(payload) > MAX_FILE_BYTES:
             raise ValueError("订阅文件过大")
         return payload
+
+
+def _validate_payloads(payloads):
+    client = json.loads(payloads["sing-box.json"])
+    if not isinstance(client, dict) or not isinstance(client.get("outbounds"), list) or not client["outbounds"]:
+        raise ValueError("缺少客户端出站；落地服务端或空配置不能作为订阅发布")
+    if not payloads["nodes.txt"].strip() or base64.b64decode(payloads["nodes.base64.txt"].strip(), validate=True) != payloads["nodes.txt"]:
+        raise ValueError("节点文本与 Base64 订阅不一致")
+    if not payloads["mihomo.yaml"].strip():
+        raise ValueError("Mihomo 配置为空")
+
+
+def _read_client_at(directory, filename, group=None):
+    if group is None:
+        return _read_at(directory, filename)
+    groups_fd = os.open("groups", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=groups_fd)
+        try:
+            return _read_at(group_fd, filename)
+        finally:
+            os.close(group_fd)
+    finally:
+        os.close(groups_fd)
 
 
 class Publisher:
@@ -127,6 +152,9 @@ class Publisher:
             raise ValueError("订阅版本无效")
         if value.get("files") != list(FILES):
             raise ValueError("订阅文件清单无效")
+        groups = value.get("groups", [])
+        if not isinstance(groups, list) or any(group not in GROUPS for group in groups) or len(groups) != len(set(groups)):
+            raise ValueError("订阅分组清单无效")
         return value
 
     def state(self):
@@ -138,21 +166,36 @@ class Publisher:
             os.close(descriptor)
 
     def publish(self, release_dir, token=None):
-        """Validate and copy four client files, then atomically switch the manifest."""
+        """Validate all root/group client files, then atomically switch one snapshot."""
         source = Path(release_dir).absolute()
         _reject_symlinks(source)
         source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             payloads = {name: _read_at(source_fd, name) for name in FILES}
+            _validate_payloads(payloads)
+            groups = []
+            try:
+                groups_fd = os.open("groups", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source_fd)
+            except FileNotFoundError:
+                groups_fd = None
+            if groups_fd is not None:
+                try:
+                    names = os.listdir(groups_fd)
+                    if any(name not in GROUPS for name in names):
+                        raise ValueError("订阅目录包含不支持的分组")
+                    groups = [group for group in GROUPS if group in names]
+                    for group in groups:
+                        group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=groups_fd)
+                        try:
+                            group_payloads = {name: _read_at(group_fd, name) for name in FILES}
+                        finally:
+                            os.close(group_fd)
+                        _validate_payloads(group_payloads)
+                        payloads.update({"groups/" + group + "/" + name: payload for name, payload in group_payloads.items()})
+                finally:
+                    os.close(groups_fd)
         finally:
             os.close(source_fd)
-        client = json.loads(payloads["sing-box.json"])
-        if not isinstance(client, dict) or not isinstance(client.get("outbounds"), list) or not client["outbounds"]:
-            raise ValueError("缺少客户端出站；落地服务端或空配置不能作为订阅发布")
-        if not payloads["nodes.txt"].strip() or base64.b64decode(payloads["nodes.base64.txt"].strip(), validate=True) != payloads["nodes.txt"]:
-            raise ValueError("节点文本与 Base64 订阅不一致")
-        if not payloads["mihomo.yaml"].strip():
-            raise ValueError("Mihomo 配置为空")
         if token is not None:
             _token(token)
         with self._lock():
@@ -167,10 +210,14 @@ class Publisher:
             staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=releases))
             destination = releases / generation
             try:
+                if groups:
+                    (staging / "groups").mkdir(mode=0o700)
+                    for group in groups:
+                        (staging / "groups" / group).mkdir(mode=0o700)
                 for name, payload in payloads.items():
                     _atomic(staging / name, payload)
                 os.replace(staging, destination)
-                value = {"schema_version": 1, "token": selected, "generation": generation, "files": list(FILES)}
+                value = {"schema_version": 1, "token": selected, "generation": generation, "files": list(FILES), "groups": groups}
                 _atomic(self.root / "state.json", json.dumps(value))
             finally:
                 if staging.exists():
@@ -195,9 +242,11 @@ class Publisher:
             _atomic(self.root / "state.json", json.dumps(value))
             return value["token"]
 
-    def url(self, base_url, filename="mihomo.yaml"):
+    def url(self, base_url, filename="mihomo.yaml", *, group=None):
         if filename not in FILES:
             raise ValueError("不支持的客户端文件")
+        if group is not None and group not in GROUPS:
+            raise ValueError("不支持的订阅分组")
         parsed = urlsplit(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("请提供没有凭据、查询参数和片段的 HTTP/HTTPS 基础地址")
@@ -205,7 +254,11 @@ class Publisher:
             parsed.port
         except ValueError as error:
             raise ValueError("基础地址端口无效") from error
-        return base_url.rstrip("/") + "/" + self.state()["token"] + "/" + filename
+        state = self.state()
+        if group is not None and group not in state.get("groups", []):
+            raise ValueError("该分组尚未发布")
+        suffix = filename if group is None else group + "/" + filename
+        return base_url.rstrip("/") + "/" + state["token"] + "/" + suffix
 
     def response(self, request_path):
         """Return a complete file snapshot, or None; no path is joined from user input."""
@@ -214,7 +267,10 @@ class Publisher:
             if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or "%" in parsed.path:
                 return None
             pieces = parsed.path.split("/")
-            if len(pieces) != 3 or pieces[0] or pieces[2] not in FILES:
+            if len(pieces) not in (3, 4) or pieces[0] or pieces[-1] not in FILES:
+                return None
+            group = pieces[2] if len(pieces) == 4 else None
+            if group is not None and group not in GROUPS:
                 return None
             _reject_symlinks(self.root)
             root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -222,18 +278,20 @@ class Publisher:
                 state = self._validate_state(json.loads(_read_at(root_fd, "state.json")))
                 if not hmac.compare_digest(pieces[1], state["token"]):
                     return None
+                if group is not None and group not in state.get("groups", []):
+                    return None
                 releases_fd = os.open("releases", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
                 try:
                     generation_fd = os.open(state["generation"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=releases_fd)
                     try:
-                        payload = _read_at(generation_fd, pieces[2])
+                        payload = _read_client_at(generation_fd, pieces[-1], group)
                     finally:
                         os.close(generation_fd)
                 finally:
                     os.close(releases_fd)
             finally:
                 os.close(root_fd)
-            mime = "application/json" if pieces[2].endswith(".json") else "text/plain; charset=utf-8"
+            mime = "application/json" if pieces[-1].endswith(".json") else "text/plain; charset=utf-8"
             return payload, mime
         except (OSError, ValueError, TypeError):
             return None

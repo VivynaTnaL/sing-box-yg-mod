@@ -2,6 +2,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,171 @@ class PublishTests(unittest.TestCase):
     def nodes(self, text):
         (self.release / "nodes.txt").write_text(text)
         (self.release / "nodes.base64.txt").write_bytes(base64.b64encode(text.encode()) + b"\n")
+
+    def group(self, group, version="first"):
+        target = self.release / "groups" / group
+        target.mkdir(parents=True, exist_ok=True)
+        node = "vless://" + version + "@" + group.lower() + ".example.com:8443\n"
+        (target / "mihomo.yaml").write_text("proxies: [" + group + "]\n")
+        (target / "sing-box.json").write_text(json.dumps({"outbounds": [{"type": "direct", "tag": group}]}))
+        (target / "nodes.txt").write_text(node)
+        (target / "nodes.base64.txt").write_bytes(base64.b64encode(node.encode()) + b"\n")
+        (target / "server.json").write_text("server private key")
+        (target / "handoff.json").write_text("handoff password")
+        return target
+
+    def test_each_group_has_independent_files_and_root_stays_compatible(self):
+        for group in publish.GROUPS:
+            self.group(group)
+        state = self.publisher.publish(self.release)
+        self.assertEqual(state["groups"], list(publish.GROUPS))
+        base = "https://sub.example.com/sub"
+        for group in publish.GROUPS:
+            for filename in publish.FILES:
+                with self.subTest(group=group, filename=filename):
+                    path = "/" + state["token"] + "/" + group + "/" + filename
+                    self.assertEqual(self.publisher.url(base, filename, group=group), base + path)
+                    payload, _ = self.publisher.response(path)
+                    self.assertEqual(payload, (self.release / "groups" / group / filename).read_bytes())
+            published = self.publisher.root / "releases" / state["generation"] / "groups" / group
+            self.assertEqual(set(item.name for item in published.iterdir()), set(publish.FILES))
+        self.assertEqual(self.publisher.response("/" + state["token"] + "/nodes.txt")[0], (self.release / "nodes.txt").read_bytes())
+
+    def test_group_subset_changes_atomically_and_removed_group_is_unavailable(self):
+        self.group("A-direct")
+        first = self.publisher.publish(self.release)
+        self.assertEqual(first["groups"], ["A-direct"])
+        with self.assertRaisesRegex(ValueError, "尚未发布"):
+            self.publisher.url("https://sub.example.com", group="B-direct")
+        shutil.rmtree(self.release / "groups" / "A-direct")
+        self.group("B-direct", "second")
+        second = self.publisher.publish(self.release)
+        self.assertEqual(first["token"], second["token"])
+        self.assertEqual(second["groups"], ["B-direct"])
+        self.assertIsNone(self.publisher.response("/" + second["token"] + "/A-direct/nodes.txt"))
+        self.assertIn(b"second@b-direct", self.publisher.response("/" + second["token"] + "/B-direct/nodes.txt")[0])
+
+    def test_group_updates_keep_urls_and_token_rotation_expires_all_groups(self):
+        self.group("A-to-B")
+        first = self.publisher.publish(self.release)
+        original_url = self.publisher.url("https://sub.example.com", "nodes.txt", group="A-to-B")
+        self.group("A-to-B", "second")
+        second = self.publisher.publish(self.release)
+        self.assertEqual(original_url, self.publisher.url("https://sub.example.com", "nodes.txt", group="A-to-B"))
+        self.assertIn(b"second@a-to-b", self.publisher.response("/" + second["token"] + "/A-to-B/nodes.txt")[0])
+        token = self.publisher.rotate_token()
+        self.assertIsNone(self.publisher.response("/" + first["token"] + "/A-to-B/nodes.txt"))
+        self.assertIsNotNone(self.publisher.response("/" + token + "/A-to-B/nodes.txt"))
+
+    def test_old_manifest_without_groups_continues_serving_root_files(self):
+        state = self.publisher.publish(self.release)
+        state.pop("groups")
+        (self.publisher.root / "state.json").write_text(json.dumps(state))
+        self.assertEqual(self.publisher.state(), state)
+        self.assertIsNotNone(self.publisher.response("/" + state["token"] + "/nodes.txt"))
+        self.assertIsNone(self.publisher.response("/" + state["token"] + "/A-direct/nodes.txt"))
+        self.group("A-direct")
+        self.assertEqual(self.publisher.publish(self.release)["token"], state["token"])
+
+    def test_group_paths_reject_traversal_encoding_extra_segments_and_private_files(self):
+        self.group("A-to-B")
+        token = self.publisher.publish(self.release)["token"]
+        paths = ["A-to-B/server.json", "A-to-B/handoff.json", "A-to-B/../state.json", "A-to-B/../nodes.txt",
+                 "%41-to-B/nodes.txt", "A-to-B/%6eodes.txt", "A-to-B/nodes.txt?download=1", "A-to-B/nodes.txt#x",
+                 "A-to-B/nodes.txt/extra", "A-to-B//nodes.txt", "groups/A-to-B/nodes.txt", "other/nodes.txt",
+                 "../nodes.txt", "A-to-B/", "A-to-B"]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIsNone(self.publisher.response("/" + token + "/" + path))
+        for group in ("groups/A-to-B", "../A-direct", "other", "a-direct"):
+            with self.subTest(group=group), self.assertRaisesRegex(ValueError, "不支持"):
+                self.publisher.url("https://sub.example.com", group=group)
+
+    def test_incomplete_group_is_rejected_without_changing_existing_publication(self):
+        original = self.publisher.publish(self.release)
+        group = self.group("A-direct")
+        (group / "nodes.base64.txt").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.publisher.publish(self.release)
+        self.assertEqual(self.publisher.state(), original)
+
+    def test_every_group_must_pass_the_client_validation(self):
+        original = self.publisher.publish(self.release)
+        for filename, payload in (("sing-box.json", '{"inbounds":[]}'), ("nodes.base64.txt", "YQ=="), ("mihomo.yaml", "")):
+            group = self.group("B-direct")
+            (group / filename).write_text(payload)
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                self.publisher.publish(self.release)
+            self.assertEqual(self.publisher.state(), original)
+
+    def test_group_limit_and_manifest_groups_reject_unknown_and_duplicate_names(self):
+        original = self.publisher.publish(self.release)
+        self.group("unrecognized")
+        with self.assertRaisesRegex(ValueError, "不支持的分组"):
+            self.publisher.publish(self.release)
+        self.assertEqual(self.publisher.state(), original)
+        for groups in (["A-direct", "A-direct"], ["../private"], "A-direct", None, [{}]):
+            with self.subTest(groups=groups), self.assertRaisesRegex(ValueError, "分组清单无效"):
+                self.publisher._validate_state(dict(original, groups=groups))
+
+    def test_group_source_symlinks_are_rejected_at_every_directory_and_file_level(self):
+        original = self.publisher.publish(self.release)
+        for component in ("groups", "groups/A-direct", "groups/A-direct/nodes.txt"):
+            self.group("A-direct")
+            target = self.release / component
+            moved = self.root / "moved"
+            target.rename(moved)
+            target.symlink_to(moved, target_is_directory=moved.is_dir())
+            with self.subTest(component=component), self.assertRaises((OSError, ValueError)):
+                self.publisher.publish(self.release)
+            self.assertEqual(self.publisher.state(), original)
+            target.unlink()
+            moved.rename(target)
+
+    def test_published_group_symlinks_are_rejected_at_every_level(self):
+        self.group("A-direct")
+        state = self.publisher.publish(self.release)
+        generation = self.publisher.root / "releases" / state["generation"]
+        for component in ("groups", "groups/A-direct", "groups/A-direct/nodes.txt"):
+            target = generation / component
+            moved = self.root / "moved"
+            target.rename(moved)
+            target.symlink_to(moved, target_is_directory=moved.is_dir())
+            with self.subTest(component=component):
+                self.assertIsNone(self.publisher.response("/" + state["token"] + "/A-direct/nodes.txt"))
+            target.unlink()
+            moved.rename(target)
+
+    def test_group_publication_failure_keeps_previous_group_and_root_snapshot(self):
+        self.group("A-to-B")
+        first = self.publisher.publish(self.release)
+        self.group("A-to-B", "second")
+        self.nodes("vless://new@example.com:8443\n")
+        original = publish._atomic
+
+        def atomic(path, payload, mode=0o600):
+            if Path(path).name == "state.json":
+                raise OSError("disk full")
+            return original(path, payload, mode)
+
+        with patch.object(publish, "_atomic", side_effect=atomic), self.assertRaises(OSError):
+            self.publisher.publish(self.release)
+        self.assertEqual(self.publisher.state(), first)
+        self.assertIn(b"first@a-to-b", self.publisher.response("/" + first["token"] + "/A-to-B/nodes.txt")[0])
+        self.assertIn(b"test@example", self.publisher.response("/" + first["token"] + "/nodes.txt")[0])
+
+    def test_transaction_rolls_back_group_additions_removals_and_content(self):
+        self.group("A-direct")
+        first = self.publisher.publish(self.release)
+        with self.assertRaisesRegex(OSError, "metadata full"):
+            with self.publisher.transaction():
+                shutil.rmtree(self.release / "groups" / "A-direct")
+                self.group("B-direct")
+                self.publisher.publish(self.release)
+                raise OSError("metadata full")
+        self.assertEqual(self.publisher.state(), first)
+        self.assertIsNotNone(self.publisher.response("/" + first["token"] + "/A-direct/nodes.txt"))
+        self.assertIsNone(self.publisher.response("/" + first["token"] + "/B-direct/nodes.txt"))
 
     def test_snapshot_whitelist_and_fixed_url_across_updates(self):
         first = self.publisher.publish(self.release)

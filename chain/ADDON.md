@@ -29,6 +29,8 @@
 4. **A：菜单 1**，选择中转 A，填写源配置路径、客户端访问 A 的 IP/域名及 B 对接文件路径。
 5. **A：菜单 2**，安装并部署；首次生成国内直连配置会自动从 GitHub 获取规则。菜单 5 导出客户端文件，菜单 6 设置订阅 URL，菜单 7 设置分流或每日规则更新。
 
+菜单 **5** 包含五项：导出全部或指定组、本机直连节点导入、跨机节点导出、跨机节点导入、应用直连组。已有部署时，通过菜单添加或导入直连节点会自动刷新客户端配置，无需重新部署代理。
+
 尚无服务端配置时，可用菜单 **10** 的中文向导生成，再交给菜单 1 导入。向导支持选择协议、端口、Reality 域名和 TLS 证书，不需要手写 JSON。
 
 以后继续使用同一个 `--state` 路径。安装完成后也可以在任意目录运行 `sb-chain --state /root/addon-state`。
@@ -155,6 +157,83 @@ chmod 600 /root/B-handoff.json
 
 优先使用完整配置。已验证 Mihomo **1.19.31** 和 sing-box **1.14.0** 的配置加载；旧 Clash 内核及其他客户端不保证支持。URI 中的 TLS 指纹参数并非所有客户端都支持，完整配置保留的证书验证信息更完整。纯节点订阅本身不携带分流规则。sing-box 导出没有自动配置 TUN，手机/TUN 客户端可能需要按其接入方式调整入站。
 
+### A、B、A→B 各自一套配置与订阅
+
+在 **A 上统一发布**三组即可，B 无需额外部署订阅服务：
+
+| 分组 | 客户端使用代理时的路径 | 所需服务 |
+| --- | --- | --- |
+| `A-direct` | 客户端 → A → 互联网 | A 的原代理服务 |
+| `B-direct` | 客户端 → B → 互联网 | B 的原代理服务 |
+| `A-to-B` | 客户端 → A 的附件入口 → B 的附件入口 → 互联网 | A、B 的附件服务 |
+
+`A-direct`、`B-direct` 使用对应原服务的监听端口和凭据；原服务必须运行，入口必须对客户端可达。B 的附件 SS2022 链路入口只供 A 连接，不能作为 `B-direct` 节点。每组完整配置仍遵循所选的国内、局域网直连规则。
+
+#### 已部署用户先更新工具
+
+若两端已完成初始化和部署，在 **A、B 各自的仓库目录**运行：
+
+```bash
+git pull --ff-only origin feat/standalone-chain
+./sb-chain --state /root/addon-state install
+```
+
+上例沿用 `/root/addon-state`；请换成初始化时使用的目录，默认目录为 `/etc/sing-box-addon`。`install` 更新工具与服务定义；无需重新初始化或再次选择菜单 2，现有代理继续运行。
+
+#### 1. B 导出客户端交换文件
+
+在 **B** 运行，地址填写客户端访问 B 的公网 IP 或域名：
+
+```bash
+./sb-chain --state /root/addon-state export-nodes \
+  --config /etc/s-box/sb.json \
+  --address original-b.example.com \
+  --label B-direct \
+  --output /root/B-client-nodes.json
+```
+
+输出路径须为新文件；可重复传入 `--inbound TAG` 选择协议入站，也可用 `--binary` 指定内核。这是标准 sing-box 客户端交换配置，只包含客户端所需的地址、认证凭据及公证书信息，不含服务端私钥或本机文件依赖。该文件仍含节点凭据，应通过 SSH/SFTP 传给 A。
+
+在 **A** 取回它：
+
+```bash
+scp root@203.0.113.20:/root/B-client-nodes.json /root/B-client-nodes.json
+chmod 600 /root/B-client-nodes.json
+```
+
+#### 2. A 导入两组直连节点并应用
+
+在 **A** 运行：
+
+```bash
+./sb-chain --state /root/addon-state add-direct \
+  --config /etc/s-box/sb.json \
+  --address original-a.example.com \
+  --label A-direct
+./sb-chain --state /root/addon-state import-nodes \
+  --config /root/B-client-nodes.json \
+  --label B-direct
+./sb-chain --state /root/addon-state publish-clients
+```
+
+`add-direct`、`import-nodes` 在 CLI 中只准备直连组；`publish-clients` 将这两组应用到已部署的客户端配置，同时刷新已设置的订阅。它保留已部署的 `A-to-B` 节点、链路端口、密钥和分流策略，不重启代理，也不提前发布其他待部署的修改。菜单 5 中的添加、导入操作会在已有部署时自动完成这一步。
+
+#### 3. 按组导出或发布
+
+独立导出每组到不同的新目录：
+
+```bash
+./sb-chain --state /root/addon-state export --group A-direct --output-dir /root/A-clients-1
+./sb-chain --state /root/addon-state export --group B-direct --output-dir /root/B-clients-1
+./sb-chain --state /root/addon-state export --group A-to-B --output-dir /root/A-B-clients-1
+```
+
+每个目录都有上表中的四种客户端文件。不传 `--group` 时，仍导出可选择全部节点的合并配置。
+
+`export` 读取准备状态，在线订阅读取已应用状态。如果另有尚未 `deploy` 的 A→B 端口或凭据修改，离线导出会包含这些待部署参数；在线订阅继续使用当前链路参数。
+
+接着在 A 按下面任一种方式执行 `publish`。如果升级前已开启订阅，需按原来的地址、监听端口和 TLS 参数重新执行一次完整的 `publish` 命令，让订阅服务加载新版分组路由。原路径口令保持不变。
+
 ### 方式一：本机监听，由已有 HTTPS 反向代理发布
 
 先完成 A 的 `deploy`，再运行：
@@ -175,7 +254,7 @@ location / {
 }
 ```
 
-HTTPS 站点和证书由反向代理自行管理。示例使用独立订阅域名；若使用子路径，反向代理需要去掉该前缀，后端仅接收 `/<口令>/<文件名>`。
+HTTPS 站点和证书由反向代理自行管理。示例使用独立订阅域名；若使用子路径，反向代理需要去掉该前缀，后端接收 `/<口令>/<文件名>` 或 `/<口令>/<分组>/<文件名>`。
 
 ### 方式二：附件直接提供 HTTPS
 
@@ -192,7 +271,18 @@ HTTPS 站点和证书由反向代理自行管理。示例使用独立订阅域�
 
 如使用 `http://服务器IP:18080` 并省略证书参数，服务提供明文 HTTP：路径口令限制访问，但不加密订阅内容。公网使用 HTTPS。
 
-发布后显示固定地址，例如 `https://sub.example.com/<随机口令>/mihomo.yaml`。后台只提供上述四个客户端文件，服务端配置、私钥和 `handoff.json` 不在发布清单中。后续 `deploy`、`geodata` 或 `refresh-clients` 成功后更新内容，URL 保持不变：
+发布后显示已存在分组的固定地址，例如：
+
+| 分组 | Mihomo 订阅示例 |
+| --- | --- |
+| A 直连 | `https://sub.example.com/<随机口令>/A-direct/mihomo.yaml` |
+| B 直连 | `https://sub.example.com/<随机口令>/B-direct/mihomo.yaml` |
+| A→B 链式 | `https://sub.example.com/<随机口令>/A-to-B/mihomo.yaml` |
+| 全部节点 | `https://sub.example.com/<随机口令>/mihomo.yaml` |
+
+按客户端需要，将末尾文件名替换为 `sing-box.json`、`nodes.txt` 或 `nodes.base64.txt`。未导入的直连组不会产生空订阅；每个独立组只包含该组节点。后台仅提供这些固定组中的四种客户端文件，服务端配置、私钥和 `handoff.json` 不在发布清单中。
+
+后续 `deploy`、`publish-clients`、`geodata` 或 `refresh-clients` 成功后更新内容，各组与合并订阅的 URL 保持不变：
 
 ```bash
 ./sb-chain --state /root/addon-state urls
@@ -201,23 +291,14 @@ HTTPS 站点和证书由反向代理自行管理。示例使用独立订阅域�
 ./sb-chain --state /root/addon-state start-publish
 ```
 
-轮换口令会让旧 URL 失效，需要在客户端更新地址。
+轮换口令会让合并订阅与各组的旧 URL 一起失效，需要在客户端更新地址。
+各组共用同一个访问口令；独立 URL 用于选择节点组，不提供不同用户之间的访问权限隔离。
 
 部署、订阅切换与管理状态保存放在同一回滚流程中。启动失败、发布失败或最后保存状态失败时恢复之前的配置和订阅；若操作系统拒绝恢复服务，会明确报错，不能把进程健康检查当作跨服务器连通性验证。重新设置发布地址或证书失败时也会恢复原发布设置。
 
-## 合并原节点、更新与启停
+## 更新与启停
 
-在 A 将原 A/B 节点加入同一份订阅：
-
-```bash
-./sb-chain --state /root/addon-state add-direct \
-  --config /root/A-server.json --address original-a.example.com --label A-direct
-./sb-chain --state /root/addon-state add-direct \
-  --config /root/B-server.json --address original-b.example.com --label B-direct
-./sb-chain --state /root/addon-state deploy
-```
-
-这些节点是源配置的导出快照；使用它们需要对应原服务正常运行。附件自己的 A → B 服务不因此依赖原服务的运行时。原节点变化后，重新执行对应的 `add-direct` 和 `deploy`。
+直连节点是源配置的导出快照。A 原节点变化后，在 A 重新 `add-direct`；B 原节点变化后，在 B 重新 `export-nodes` 并交给 A 执行 `import-nodes`。最后在 A 执行 `publish-clients`，即可同时更新合并订阅和各组订阅，无需重启 A→B 代理。
 
 重新导入 A 的接入配置或更新证书：
 
@@ -238,7 +319,7 @@ HTTPS 站点和证书由反向代理自行管理。示例使用独立订阅域�
 
 `stop` 停止附件并取消其开机启动；`start` 恢复附件并启用开机启动。它们不停止原服务。订阅发布单独通过 `stop-publish` / `start-publish` 管理。
 
-`init-*`、`import-config`、`update-link`、`rules` 和 `add-direct` 只准备配置；`deploy` 才启用服务端更新并切换订阅。纯规则更新使用 `geodata` 或 `refresh-clients`，无需部署服务端。
+CLI 中，`init-*`、`import-config`、`update-link`、`rules`、`add-direct` 和 `import-nodes` 只准备配置；`deploy` 才启用服务端更新并切换订阅。仅更新直连组使用 `publish-clients`，仅更新规则使用 `geodata` 或 `refresh-clients`，两种情况都无需部署服务端。
 
 ## 只生成配置与手动运行
 
@@ -315,6 +396,6 @@ python3 chain/tests/integration_addon.py --binary /path/to/sing-box-1.14.0
 python3 chain/tests/integration_publish_tls.py
 ```
 
-集成测试只在 `/tmp` 和回环网络运行临时进程，检查独立端口、原服务与附件并行、TCP/UDP、私网与来源限制、链路故障隔离、客户端规则选择直连/代理出口，以及订阅 HTTP/HTTPS 下载、更新、口令轮换和回滚。它不调用 systemd，也不更改现有部署。
+集成测试只在 `/tmp` 和回环网络运行临时进程，检查独立端口、原服务与附件并行、TCP/UDP、私网与来源限制、链路故障隔离、客户端规则选择直连/代理出口，以及合并、分组订阅的 HTTP/HTTPS 下载、更新、口令轮换和回滚。它不调用 systemd，也不更改现有部署。
 
 配置检查和进程健康检查不代表 A → B 公网连通性。实际部署仍需在目标服务器确认端口可达、B 的来源 IP 正确，并从客户端验证所选节点和分流结果。

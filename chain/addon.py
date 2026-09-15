@@ -141,10 +141,17 @@ def initialize_entry(args, store, refresh=False):
     return state
 
 
-def export_clients(state, dest):
+def export_clients(state, dest, group=None):
     from export_clash import convert, yaml_text
     from policy import apply_mihomo, apply_singbox
+    from publish import GROUPS
     groups = state.get('groups', {})
+    if set(groups) - set(GROUPS):
+        raise ConfigError('未知客户端节点组')
+    if group is not None:
+        if group not in GROUPS or group not in groups:
+            raise ConfigError('尚未添加该客户端节点组：' + str(group))
+        groups = {group: groups[group]}
     if not groups:
         return False
     nodes, outbound_nodes, mh_groups, sb_groups, links = [], [], [], [], []
@@ -212,6 +219,12 @@ def build(store, state=None):
         if state.get('handoff'):
             write_private(staging / 'handoff.json', state['handoff'])
         has_clients = export_clients(state, staging)
+        if has_clients:
+            (staging / 'groups').mkdir(mode=0o700)
+            for group in state['groups']:
+                directory = staging / 'groups' / group
+                directory.mkdir(mode=0o700)
+                export_clients(state, directory, group=group)
         write_private(staging / 'manifest.json', {'schema_version': 1, 'role': state['role'],
                       'groups': list(state['groups']), 'clients': has_clients})
         dest = releases / secrets.token_hex(12)
@@ -269,13 +282,18 @@ def show_status(store):
 
 
 def show_urls(store):
-    from publish import Publisher
+    from publish import FILES, Publisher
     settings = store.read('publication.json', optional=True)
     if not settings:
         raise ConfigError('尚未设置订阅发布')
     publisher = Publisher(settings['root'])
     print('以下地址含访问口令，请仅保存到自己的客户端：')
-    for filename in ('mihomo.yaml', 'sing-box.json', 'nodes.txt', 'nodes.base64.txt'):
+    for group in publisher.state().get('groups', []):
+        print('\n' + group + '：')
+        for filename in FILES:
+            print(filename + ': ' + publisher.url(settings['base_url'], filename, group=group))
+    print('\n合并配置：')
+    for filename in FILES:
         print(filename + ': ' + publisher.url(settings['base_url'], filename))
 
 
@@ -327,6 +345,17 @@ def parser():
     p.add_argument('--address', required=True)
     p.add_argument('--label', required=True, choices=['A-direct', 'B-direct'])
     p.add_argument('--inbound', action='append')
+    p = sub.add_parser('export-nodes', help='在来源机导出可跨机交换的客户端节点，无服务端私钥')
+    p.add_argument('--config', required=True)
+    p.add_argument('--address', required=True)
+    p.add_argument('--label', required=True, choices=['A-direct', 'B-direct'])
+    p.add_argument('--output', required=True, help='尚不存在的输出文件')
+    p.add_argument('--inbound', action='append')
+    p.add_argument('--binary')
+    p = sub.add_parser('import-nodes', help='从跨机客户端配置导入直连组')
+    p.add_argument('--config', required=True)
+    p.add_argument('--label', required=True, choices=['A-direct', 'B-direct'])
+    p.add_argument('--binary')
     p = sub.add_parser('update-link', help='更换 B 对接配置，保留附件客户端凭据')
     p.add_argument('--link', required=True)
     p = sub.add_parser('rules', help='设置客户端分流及例外；不改变服务器链路规则')
@@ -345,6 +374,7 @@ def parser():
     p.add_argument('--binary')
     for name in ('build', 'deploy', 'refresh-clients', 'start', 'stop', 'status', 'urls', 'rotate-token', 'stop-publish', 'start-publish', 'uninstall'):
         sub.add_parser(name)
+    sub.add_parser('publish-clients', help='应用准备好的直连节点组并刷新订阅，无需重启代理')
     p = sub.add_parser('restore-legacy', help='仅供旧接管版迁移：停止旧 chain 并恢复原 sing-box')
     p.add_argument('--no-enable', action='store_true', help='恢复原服务运行但不设置开机启动')
     p = sub.add_parser('publish', help='发布已经部署的客户端配置')
@@ -356,6 +386,8 @@ def parser():
     p.add_argument('--key')
     p = sub.add_parser('export', help='从已保存参数导出到新目录；不部署、不发布')
     p.add_argument('--output-dir', required=True)
+    from publish import GROUPS
+    p.add_argument('--group', choices=GROUPS, help='仅导出指定组；省略时导出合并配置')
     return result
 
 
@@ -406,6 +438,31 @@ def execute(args):
             state = store.read()
             state['groups'][args.label] = profiles.import_direct(args.config, args.address, args.label, args.inbound or ())
             store.save(state)
+            print('直连组已准备；执行 publish-clients 应用到客户端订阅')
+        elif args.command == 'export-nodes':
+            from clients import export_clients_source
+            target = Path(args.output).absolute()
+            if target.exists() or target.is_symlink():
+                raise ConfigError('节点交换输出文件必须尚不存在')
+            if not target.parent.is_dir():
+                raise ConfigError('输出目录不存在，请先创建目录')
+            config = export_clients_source(args.config, args.address, args.label, args.inbound or ())
+            binary = binary_for(args, store, store.read(optional=True))
+            check_config(binary, config)
+            with tempfile.TemporaryDirectory(prefix='.nodes-', dir=target.parent) as tmp:
+                candidate = Path(tmp) / 'nodes.json'
+                write_private(candidate, config)
+                try:
+                    os.link(candidate, target)
+                except FileExistsError:
+                    raise ConfigError('节点交换输出文件已经存在；已有文件不会被覆盖') from None
+            print('已导出节点交换文件（含客户端凭据，请通过 SSH/SFTP 传输）：' + str(target))
+        elif args.command == 'import-nodes':
+            from clients import import_clients
+            state = store.read()
+            state['groups'][args.label] = import_clients(args.config, args.label, binary_for(args, store, state))
+            store.save(state)
+            print('直连组已准备；执行 publish-clients 应用到客户端订阅')
         elif args.command == 'rules':
             state = store.read()
             policy = load_policy(args.mode, args.rules_dir, args.direct_domain, args.proxy_domain,
@@ -425,6 +482,12 @@ def execute(args):
             from updates import refresh_clients
             refresh_clients(store)
             print('客户端分流已应用；未重启代理')
+        elif args.command == 'publish-clients':
+            from updates import publish_clients
+            release = publish_clients(store)
+            print('直连节点组已应用：' + str(release) + '；代理无需重启')
+            if store.read('publication.json', optional=True):
+                show_urls(store)
         elif args.command == 'rules-auto':
             from scheduler import Scheduler
             scheduler = Scheduler()
@@ -448,7 +511,11 @@ def execute(args):
             target = Path(args.output_dir).absolute()
             if target.exists() or target.is_symlink():
                 raise ConfigError('输出目录必须尚不存在')
+            if args.group and args.group not in store.read().get('groups', {}):
+                raise ConfigError('尚未添加该客户端节点组：' + args.group)
             release = build(store)
+            if args.group:
+                release = release / 'groups' / args.group
             # A download/export directory contains client files only.
             with tempfile.TemporaryDirectory(prefix='.export-', dir=target.parent) as tmp:
                 staged = Path(tmp) / 'clients'
@@ -493,7 +560,7 @@ def menu(state_root):
     while True:
         print('\n独立链式代理（原服务可并行运行）\n'
               '1. 初始化中转 A / 落地 B\n2. 安装运行环境并部署\n3. 启动 / 停止 / 查看状态\n'
-              '4. 更新配置 / 落地连接\n5. 导出客户端文件 / 添加原直连节点\n'
+              '4. 更新配置 / 落地连接\n5. 客户端分组 / 跨机导入导出\n'
               '6. 发布与管理订阅 URL\n7. 客户端分流 / GitHub 自动规则更新\n'
               '8. 恢复旧接管版的原服务\n9. 卸载附件\n10. 仅生成标准 sing-box 配置\n0. 退出')
         choice = ask('请选择', '0')
@@ -543,12 +610,29 @@ def menu(state_root):
                 if action in ('1', '2', '3') and ask('生成并部署更新？y/n', 'y').lower() == 'y':
                     commands.append(['deploy'])
             elif choice == '5':
-                action = ask('1 导出客户端文件；2 添加 A-direct/B-direct 节点', '1')
+                action = ask('1 导出分组配置；2 添加本机直连节点；3 导出跨机节点；4 导入跨机节点；5 应用直连组', '1')
                 if action == '1':
-                    commands = [['export', '--output-dir', ask('新的客户端导出目录')]]
-                else:
+                    group = ask('节点组 A-direct / B-direct / A-to-B / all（合并）', 'A-to-B')
+                    cmd = ['export', '--output-dir', ask('新的客户端导出目录')]
+                    if group != 'all':
+                        cmd += ['--group', group]
+                    commands = [cmd]
+                elif action == '2':
                     commands = [['add-direct', '--config', ask('标准 sing-box 服务端配置路径'),
                                  '--address', ask('原节点公网 IP 或域名'), '--label', ask('节点组', 'A-direct')]]
+                elif action == '3':
+                    commands = [['export-nodes', '--config', ask('本机标准 sing-box 服务端配置路径', '/etc/s-box/sb.json'),
+                                 '--address', ask('原节点公网 IP 或域名'), '--label', ask('节点组', 'B-direct'),
+                                 '--output', ask('新的节点交换文件路径', '/root/B-client-nodes.json')]]
+                elif action == '4':
+                    commands = [['import-nodes', '--config', ask('节点交换文件路径', '/root/B-client-nodes.json'),
+                                 '--label', ask('节点组', 'B-direct')]]
+                elif action == '5':
+                    commands = [['publish-clients']]
+                else:
+                    raise ConfigError('请选择 1 至 5')
+                if action in ('2', '4') and Store(state_root).read('active.json', optional=True):
+                    commands.append(['publish-clients'])
             elif choice == '6':
                 action = ask('1 设置发布；2 查看 URL；3 更换访问口令；4 停止；5 启动', '2')
                 if action == '1':

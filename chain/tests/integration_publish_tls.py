@@ -12,7 +12,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from publish import FILES, Publisher
+from publish import FILES, GROUPS, Publisher
 
 
 def unused_port():
@@ -36,13 +36,21 @@ def main():
         (release / "sing-box.json").write_text('{"outbounds":[{"type":"direct"}]}')
         (release / "config.json").write_text("server-only-secret")
 
-        def nodes(value):
+        def nodes(value, destination=release):
             payload = ("vless://" + value + "@example.com:8443\n").encode()
-            (release / "nodes.txt").write_bytes(payload)
-            (release / "nodes.base64.txt").write_bytes(base64.b64encode(payload) + b"\n")
+            (destination / "nodes.txt").write_bytes(payload)
+            (destination / "nodes.base64.txt").write_bytes(base64.b64encode(payload) + b"\n")
             return payload
 
         first_payload = nodes("first")
+        group_payloads = {}
+        for group in GROUPS:
+            destination = release / "groups" / group
+            destination.mkdir(parents=True, mode=0o700)
+            (destination / "mihomo.yaml").write_text("proxies: [" + group + "]\n")
+            (destination / "sing-box.json").write_text(json.dumps({"outbounds": [{"type": "direct", "tag": group}]}))
+            (destination / "server.json").write_text("group-server-private-key")
+            group_payloads[group] = nodes(group, destination)
         publisher = Publisher(root / "public")
         first = publisher.publish(release)
         port = unused_port()
@@ -82,23 +90,39 @@ def main():
             code, payload, headers = request("/" + first["token"] + "/nodes.txt", "HEAD")
             assert code == 200 and not payload and int(headers["Content-Length"]) == len(first_payload)
             assert request("/" + first["token"] + "/config.json")[0] == 404
+            for group in GROUPS:
+                for filename in FILES:
+                    code, payload, headers = request("/" + first["token"] + "/" + group + "/" + filename)
+                    assert code == 200 and payload == (release / "groups" / group / filename).read_bytes()
+                code, payload, headers = request("/" + first["token"] + "/" + group + "/nodes.txt", "HEAD")
+                assert code == 200 and not payload and int(headers["Content-Length"]) == len(group_payloads[group])
+            for suffix in ("A-direct/server.json", "B-direct/handoff.json", "A-to-B/../nodes.txt", "A-to-B/%6eodes.txt", "groups/A-to-B/nodes.txt"):
+                assert request("/" + first["token"] + "/" + suffix)[0] == 404
 
             second_payload = nodes("second")
+            second_group_payload = nodes("A-to-B-second", release / "groups" / "A-to-B")
             publisher.publish(release)
             assert request("/" + first["token"] + "/nodes.txt")[1] == second_payload
+            assert request("/" + first["token"] + "/A-to-B/nodes.txt")[1] == second_group_payload
             rotated = publisher.rotate_token()
             assert request("/" + first["token"] + "/nodes.txt")[0] == 404
             assert request("/" + rotated + "/nodes.txt")[1] == second_payload
+            for group in GROUPS:
+                assert request("/" + first["token"] + "/" + group + "/nodes.txt")[0] == 404
+                assert request("/" + rotated + "/" + group + "/nodes.txt")[0] == 200
 
             try:
                 with publisher.transaction():
                     third_payload = nodes("third")
+                    third_group_payload = nodes("A-to-B-third", release / "groups" / "A-to-B")
                     publisher.publish(release)
                     assert request("/" + rotated + "/nodes.txt")[1] == third_payload
+                    assert request("/" + rotated + "/A-to-B/nodes.txt")[1] == third_group_payload
                     raise RuntimeError("simulated metadata failure")
             except RuntimeError:
                 pass
             assert request("/" + rotated + "/nodes.txt")[1] == second_payload
+            assert request("/" + rotated + "/A-to-B/nodes.txt")[1] == second_group_payload
         finally:
             process.terminate()
             try:
@@ -116,7 +140,7 @@ def main():
         invalid[-1] = str(wrong_key)
         result = subprocess.run(invalid, capture_output=True, timeout=10)
         assert result.returncode != 0, "mismatched TLS key unexpectedly started the server"
-        print(json.dumps({"checks": 7, "result": "pass", "scope": "verified HTTPS, HEAD, private-file exclusion, live update, token rotation, rollback, mismatched TLS rejection"}))
+        print(json.dumps({"checks": 10, "result": "pass", "scope": "verified HTTPS, HEAD, private-file exclusion, live update, token rotation, rollback, mismatched TLS rejection, group GET/HEAD, group path exclusion, group update/rotation/rollback"}))
 
 
 if __name__ == "__main__":
