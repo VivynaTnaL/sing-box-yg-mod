@@ -16,8 +16,7 @@ from contextlib import contextmanager, nullcontext
 
 from chain import ConfigError, check_config, check_version, read_json, write_private, write_text_private
 import profiles
-
-DEFAULT_STATE = Path('/etc/sing-box-addon')
+from locations import DEFAULT_STATE, state_directory
 
 
 class Store:
@@ -262,9 +261,10 @@ def deploy(store):
 def show_status(store):
     from runtime import Runtime
     from publish import Publisher
+    print('管理状态目录：' + str(store.root))
     state = store.read(optional=True)
     if not state:
-        print('尚未初始化')
+        print('此目录尚未初始化；若已有部署，请用 --state 指定原状态目录')
         return
     print('角色：' + ('中转 A' if state['role'] == 'entry' else '落地 B'))
     print('准备配置的监听端口：' + ', '.join(str(i['listen_port']) for i in state['server_config']['inbounds']))
@@ -323,7 +323,7 @@ def set_publication(args, store):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument('--state', type=Path, default=DEFAULT_STATE, help='独立状态目录')
+    result.add_argument('--state', type=Path, help='管理状态目录；默认沿用安装时保存的目录')
     sub = result.add_subparsers(dest='command')
     for name in ('init-entry', 'import-config'):
         p = sub.add_parser(name, help='导入标准 sing-box 入站配置；分配附件独立端口')
@@ -395,7 +395,7 @@ def execute(args):
     from runtime import Runtime
     from publish import Publisher
     from policy import load_policy
-    store = Store(args.state)
+    store = Store(state_directory(args.state))
     if args.command in ('status', 'urls'):
         return show_status(store) if args.command == 'status' else show_urls(store)
     if args.command == 'rules-auto' and args.action in ('disable', 'status'):
@@ -501,10 +501,12 @@ def execute(args):
         elif args.command == 'install':
             state = store.read(optional=True)
             binary = binary_for(args, store, state)
-            Runtime().install(binary, tool_dir=Path(__file__).parent)
+            Runtime().install(binary, tool_dir=Path(__file__).parent, state_root=store.root)
             if state:
                 state['binary'] = '/opt/sing-box-addon/sing-box'
                 store.save(state)
+            print('工具已安装；已记住管理状态目录：' + str(store.root))
+            print('以后可直接运行 sb-chain；显式 --state 可临时选择其他目录')
         elif args.command == 'build':
             print('已生成：' + str(build(store)))
         elif args.command == 'export':
@@ -558,6 +560,7 @@ def ask(label, default=None):
 def menu(state_root):
     # Menu is only an adapter. The exact same command functions serve automation.
     while True:
+        print('\n管理状态目录：' + str(state_root))
         print('\n独立链式代理（原服务可并行运行）\n'
               '1. 初始化中转 A / 落地 B\n2. 安装运行环境并部署\n3. 启动 / 停止 / 查看状态\n'
               '4. 更新配置 / 落地连接\n5. 客户端分组 / 跨机导入导出\n'
@@ -697,7 +700,7 @@ def main():
             if not sys.stdin.isatty():
                 parser().print_help()
                 return 0
-            return menu(args.state)
+            return menu(state_directory(args.state))
         execute(args)
         return 0
     except (ConfigError, RuntimeError) as error:

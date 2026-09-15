@@ -33,9 +33,20 @@
 
 尚无服务端配置时，可用菜单 **10** 的中文向导生成，再交给菜单 1 导入。向导支持选择协议、端口、Reality 域名和 TLS 证书，不需要手写 JSON。
 
-以后继续使用同一个 `--state` 路径。安装完成后也可以在任意目录运行 `sb-chain --state /root/addon-state`。
+安装成功后，脚本会把本次状态目录记录到 `/etc/sing-box-addon/manager.json`。以后系统命令 `sb-chain` 和仓库入口 `./sb-chain` 都会使用这个目录，可以直接运行：
 
-不传 `--state` 时管理数据默认保存在 `/etc/sing-box-addon`。`--state` 只改变管理数据的位置；当前系统服务仍是单实例，不用于在同一台机器部署多套附件。
+```bash
+sb-chain
+sb-chain status
+sb-chain urls
+```
+
+菜单和 `status` 会显示实际读取的状态目录。目录选择顺序为：本次显式 `--state` → 安装时记住的目录 → `/etc/sing-box-addon`。普通命令的显式参数只覆盖本次操作；只有成功执行 `install` 才会记住新的目录。
+
+`--state` 只改变管理数据的位置；当前系统服务仍是单实例，不用于在同一台机器部署多套附件。记录目录不会重新部署代理，也不会把正在运行的代理切换到另一份配置。
+
+已保存的设置损坏，或其指向的目录丢失时，脚本会明确报错。请先确认原状态目录，再用 `./sb-chain --state /实际状态目录 status` 检查，并以同一路径执行 `install` 修复记录；不要通过重新初始化来处理路径问题。
+如果 `manager.json` 本身变成了符号链接或目录，需要先检查并处理这个异常路径；安装会拒绝覆盖它。显式 `--state` 仍可用于管理原部署。
 
 ## 等价 CLI 教程
 
@@ -178,7 +189,11 @@ git pull --ff-only origin feat/standalone-chain
 ./sb-chain --state /root/addon-state install
 ```
 
-上例沿用 `/root/addon-state`；请换成初始化时使用的目录，默认目录为 `/etc/sing-box-addon`。`install` 更新工具与服务定义；无需重新初始化或再次选择菜单 2，现有代理继续运行。
+上例沿用 `/root/addon-state`；请换成初始化时使用的目录，原默认目录为 `/etc/sing-box-addon`。首次升级到能记住目录的版本时，自定义目录用户需要像上面这样显式指定一次。`install` 更新工具与服务定义，并记录选定的状态目录；无需重新初始化或再次选择菜单 2。成功更新不重启代理。
+
+完成后，日常运行 `sb-chain`、`sb-chain status`、`sb-chain urls`，以及之后在仓库执行 `./sb-chain install`，均可省略 `--state`。以下教程继续显式写出目录，便于照着操作时核对；已完成上述安装的用户可以省略。
+
+如果你之前为 `sb-chain` 设置过带 `--state` 的 shell 别名，别名仍会显式覆盖脚本记住的目录。仅在设置过别名的情况下，执行 `unalias sb-chain`，并从 `~/.bashrc` 删除那条旧 `alias sb-chain=...`，再通过 `sb-chain status` 验证新默认目录。没有设置别名则跳过这一步。
 
 #### 1. B 导出客户端交换文件
 
@@ -381,7 +396,7 @@ bash sb.sh --generate-config \
 ./sb-chain --state /root/addon-state uninstall
 ```
 
-卸载会停止并移除附件、订阅和规则更新服务/定时器、附件内核和管理命令，保留状态、配置、规则快照和导出内容，便于重新安装。它不会卸载原 `sb`。
+卸载会停止并移除附件、订阅和规则更新服务/定时器、附件内核和管理命令，保留状态、配置、规则快照、导出内容及 `/etc/sing-box-addon/manager.json` 中记住的目录，便于重新安装。之后从仓库执行 `./sb-chain install` 仍可找到原状态目录。它不会卸载原 `sb`。
 
 ## 验证范围
 

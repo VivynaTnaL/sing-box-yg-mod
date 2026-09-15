@@ -218,7 +218,7 @@ class Runtime:
                     raise RuntimeError("操作失败，文件已回退，但服务状态未能完全恢复：" + service) from error
                 raise
 
-    def install(self, binary, tool_dir=None):
+    def install(self, binary, tool_dir=None, state_root=None):
         source = Path(binary).resolve(strict=True)
         if not source.is_file() or not os.access(source, os.X_OK):
             raise ValueError("请提供可执行的 sing-box 内核文件")
@@ -241,7 +241,13 @@ class Runtime:
             destination = self.path(TOOL_DIR)
             payloads = {destination / item.name: item.read_bytes()
                         for item in sorted(sources.glob("*.py")) + [sources / "core.lock.json"] if item.is_file()}
-            with self.transaction(files=[self.binary, wrapper, self.unit, *payloads], reload=True):
+            settings = self.root / "manager.json"
+            remembered = (json.dumps({"schema_version": 1, "state_dir": str(Path(state_root).absolute())})
+                          if state_root is not None else None)
+            paths = [self.binary, wrapper, self.unit, *payloads]
+            if remembered is not None:
+                paths.append(settings)
+            with self.transaction(files=paths, reload=True):
                 self.root.chmod(0o700)
                 if changed:
                     atomic_write(self.binary, source_bytes, 0o755)
@@ -250,6 +256,8 @@ class Runtime:
                     atomic_write(path, payload, 0o644)
                 atomic_write(wrapper, '#!/bin/sh\n# sing-box-addon managed launcher\nexec python3 /opt/sing-box-addon/tool/addon.py "$@"\n', 0o755)
                 atomic_write(self.unit, self._unit_text(), 0o644)
+                if remembered is not None:
+                    atomic_write(settings, remembered)
                 self._daemon_reload()
         return {"binary": str(self.binary), "service": SERVICE, "launcher": str(wrapper)}
 

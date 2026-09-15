@@ -441,6 +441,27 @@ class AddonTests(unittest.TestCase):
         self.assertEqual(selected, str(cached))
         download.assert_not_called()
 
+    def test_install_remembers_custom_store_for_later_commands_without_state(self):
+        import locations
+        self.initialize()
+        self.core.chmod(0o755)
+        runtime, _, system = self.deployment_components()
+        settings = runtime.root / 'manager.json'
+        with (patch('runtime.Runtime', return_value=runtime),
+              patch('addon.binary_for', return_value=str(self.core)),
+              patch.object(locations, 'MANAGER_SETTINGS', settings)):
+            self.execute('install')
+            self.assertEqual(locations.state_directory(), self.store.root)
+            before = settings.read_bytes()
+            for command in ('status', 'install'):
+                with redirect_stdout(io.StringIO()) as output:
+                    addon.execute(addon.parser().parse_args([command]))
+                self.assertIn(str(self.store.root), output.getvalue())
+                self.assertNotIn('尚未初始化', output.getvalue())
+            self.assertEqual(settings.read_bytes(), before)
+        self.assertFalse(any(argv[0] == 'systemctl' and argv[1] in ('stop', 'start', 'restart')
+                             for argv in system.calls))
+
     def test_uninstalled_binary_download_target_is_independent_cache(self):
         with self.store.locked():
             args = addon.parser().parse_args(['--state', str(self.store.root), 'install'])

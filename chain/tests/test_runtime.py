@@ -90,6 +90,69 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.install(self.source)
         self.assertEqual(self.runtime.binary.read_text(), "fake core")
 
+    def test_install_remembers_directory_without_changing_running_proxy(self):
+        from locations import state_directory
+        state_root = self.root / "custom state"
+        state_root.mkdir()
+        self.system.active[runtime.SERVICE] = True
+        self.system.enabled[runtime.SERVICE] = True
+        config = self.runtime.root / "config.json"
+        config.write_text('{"existing":"deployed configuration"}')
+        original = config.read_bytes()
+        inode = self.runtime.binary.stat().st_ino
+
+        self.runtime.install(self.source, state_root=state_root)
+
+        settings = self.runtime.root / "manager.json"
+        self.assertEqual(state_directory(settings_path=settings), state_root)
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(self.runtime.path(runtime.TOOL_DIR / "locations.py").is_file())
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(self.runtime.binary.stat().st_ino, inode)
+        self.assertTrue(self.system.active[runtime.SERVICE])
+        self.assertTrue(self.system.enabled[runtime.SERVICE])
+        self.assertFalse(any(argv[0] == "systemctl" and argv[1] in
+                             ("stop", "start", "restart", "enable", "disable")
+                             for argv in self.system.calls))
+
+    def test_failed_install_restores_or_removes_remembered_directory(self):
+        settings = self.runtime.root / "manager.json"
+        previous = b'{"schema_version":1,"state_dir":"/previous-state"}'
+        for before in (None, previous):
+            with self.subTest(existing=before is not None):
+                if before is None:
+                    settings.unlink(missing_ok=True)
+                else:
+                    settings.write_bytes(before)
+                reload = self.runtime._daemon_reload
+                calls = 0
+
+                def fail_once():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise RuntimeError("reload rejected")
+                    return reload()
+
+                with patch.object(self.runtime, "_daemon_reload", side_effect=fail_once):
+                    with self.assertRaisesRegex(RuntimeError, "reload rejected"):
+                        self.runtime.install(self.source, state_root=self.root / "new-state")
+                if before is None:
+                    self.assertFalse(settings.exists())
+                else:
+                    self.assertEqual(settings.read_bytes(), before)
+
+    def test_uninstall_retains_remembered_directory_for_reinstall(self):
+        from locations import state_directory
+        state_root = self.root / "retained-state"
+        state_root.mkdir()
+        self.runtime.install(self.source, state_root=state_root)
+        self.runtime.uninstall()
+        settings = self.runtime.root / "manager.json"
+        self.assertEqual(state_directory(settings_path=settings), state_root)
+        self.runtime.install(self.source)
+        self.assertEqual(state_directory(settings_path=settings), state_root)
+
     def test_install_rejects_unlocked_core_version(self):
         original = self.runtime._run
 
