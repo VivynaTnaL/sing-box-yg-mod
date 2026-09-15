@@ -557,13 +557,27 @@ def ask(label, default=None):
     return value or default or ''
 
 
+class MenuBack(Exception):
+    """Leave a submenu before any queued commands execute."""
+
+
+def menu_choice(label, choices, default='0'):
+    print(label)
+    value = ask('请选择（0 返回主菜单）', default)
+    if value == '0':
+        raise MenuBack()
+    if value not in choices:
+        raise ConfigError('输入无效，请选择菜单中列出的选项')
+    return value
+
+
 def menu(state_root):
     # Menu is only an adapter. The exact same command functions serve automation.
     while True:
         print('\n管理状态目录：' + str(state_root))
         print('\n独立链式代理（原服务可并行运行）\n'
               '1. 初始化中转 A / 落地 B\n2. 安装运行环境并部署\n3. 启动 / 停止 / 查看状态\n'
-              '4. 更新配置 / 落地连接\n5. 客户端分组 / 跨机导入导出\n'
+              '4. 修改链式服务配置（应用时重启）\n5. 客户端分组 / 跨机导入导出\n'
               '6. 发布与管理订阅 URL\n7. 客户端分流 / GitHub 自动规则更新\n'
               '8. 恢复旧接管版的原服务\n9. 卸载附件\n10. 仅生成标准 sing-box 配置\n0. 退出')
         choice = ask('请选择', '0')
@@ -572,7 +586,7 @@ def menu(state_root):
         commands = []
         try:
             if choice == '1':
-                role = ask('本机是中转 A 还是落地 B', 'B').upper()
+                role = menu_choice('本机是中转 A 还是落地 B', ('A', 'a', 'B', 'b'), 'B').upper()
                 binary = ask('已有 sing-box 内核路径（留空自动准备）')
                 if role == 'B':
                     command = ['init-exit', '--address', ask('B 接收链路的 IP'), '--port', ask('独立链路端口', '22000')]
@@ -595,10 +609,16 @@ def menu(state_root):
             elif choice == '2':
                 commands = [['install'], ['deploy']]
             elif choice == '3':
-                action = ask('1 启动；2 停止；3 状态', '3')
+                action = menu_choice('1 启动；2 停止；3 状态', ('1', '2', '3'), '3')
                 commands = [[{'1': 'start', '2': 'stop', '3': 'status'}[action]]]
             elif choice == '4':
-                action = ask('1 重新导入 A 接入配置；2 更换 B 对接；3 更新 B 地址/来源；4 部署准备好的配置', '4')
+                print('这里修改本机链式服务的入口或 A 到 B 的连接；应用配置会重启本机附件代理。\n'
+                      '导出客户端配置或发布订阅，请使用主菜单 5、6。')
+                action = menu_choice('1. 从文件更新 A 的链式入口（协议 / 证书）\n'
+                                     '2. 更新 A 连接 B 所用的对接文件\n'
+                                     '3. 修改 B 的公网地址、链路端口或允许的 A IP\n'
+                                     '4. 应用已保存的服务端配置，并重启附件代理',
+                                     ('1', '2', '3', '4'))
                 if action == '1':
                     commands = [['import-config', '--config', ask('新源配置路径')]]
                 elif action == '2':
@@ -608,12 +628,16 @@ def menu(state_root):
                     for source in ask('A 的实际出站 IP（空格分隔）').split():
                         cmd += ['--entry-source', source]
                     commands = [cmd]
-                else:
+                elif action == '4':
                     commands = [['deploy']]
-                if action in ('1', '2', '3') and ask('生成并部署更新？y/n', 'y').lower() == 'y':
-                    commands.append(['deploy'])
+                if action in ('1', '2', '3'):
+                    apply_now = menu_choice('是否立即应用更新并重启附件代理？y 应用；n 仅保存',
+                                            ('y', 'Y', 'n', 'N'), 'n')
+                    if apply_now.lower() == 'y':
+                        commands.append(['deploy'])
             elif choice == '5':
-                action = ask('1 导出分组配置；2 添加本机直连节点；3 导出跨机节点；4 导入跨机节点；5 应用直连组', '1')
+                action = menu_choice('1 导出分组配置；2 添加本机直连节点；3 导出跨机节点；4 导入跨机节点；5 应用直连组',
+                                     ('1', '2', '3', '4', '5'), '1')
                 if action == '1':
                     group = ask('节点组 A-direct / B-direct / A-to-B / all（合并）', 'A-to-B')
                     cmd = ['export', '--output-dir', ask('新的客户端导出目录')]
@@ -637,7 +661,8 @@ def menu(state_root):
                 if action in ('2', '4') and Store(state_root).read('active.json', optional=True):
                     commands.append(['publish-clients'])
             elif choice == '6':
-                action = ask('1 设置发布；2 查看 URL；3 更换访问口令；4 停止；5 启动', '2')
+                action = menu_choice('1 设置发布；2 查看 URL；3 更换访问口令；4 停止；5 启动',
+                                     ('1', '2', '3', '4', '5'), '2')
                 if action == '1':
                     cmd = ['publish', '--base-url', ask('客户端访问的基地址（如 https://sub.example.com）'),
                            '--bind', ask('监听 IP（反向代理用127.0.0.1；直接公网用0.0.0.0）', '127.0.0.1'),
@@ -649,17 +674,20 @@ def menu(state_root):
                 else:
                     commands = [[{'2': 'urls', '3': 'rotate-token', '4': 'stop-publish', '5': 'start-publish'}[action]]]
             elif choice == '7':
-                action = ask('1 立即更新 GitHub 规则；2 设置分流；3 每日自动更新；4 导入本机规则库', '1')
+                action = menu_choice('1 立即更新 GitHub 规则；2 设置分流；3 每日自动更新；4 导入本机规则库',
+                                     ('1', '2', '3', '4'))
                 if action == '1':
                     commands = [['geodata']]
                 elif action == '3':
-                    value = {'1': 'enable', '2': 'disable', '3': 'status'}[ask('1 启用；2 停用；3 状态', '1')]
+                    value = {'1': 'enable', '2': 'disable', '3': 'status'}[
+                        menu_choice('1 启用；2 停用；3 状态', ('1', '2', '3'), '3')]
                     commands = [['rules-auto', value]]
                 elif action == '4':
                     commands = [['geodata', '--geoip', ask('GeoIP 文件', '/root/geoip.db'),
                                  '--geosite', ask('GeoSite 文件', '/root/geosite.db')]]
                 elif action == '2':
-                    mode = {'1': 'cn-direct', '2': 'lan-direct', '3': 'global'}[ask('1 国内/局域网直连；2 仅局域网直连；3 全部代理', '1')]
+                    mode = {'1': 'cn-direct', '2': 'lan-direct', '3': 'global'}[
+                        menu_choice('1 国内/局域网直连；2 仅局域网直连；3 全部代理', ('1', '2', '3'))]
                     cmd = ['rules', '--mode', mode]
                     for flag, prompt in (('--direct-domain', '始终直连的域名后缀'), ('--proxy-domain', '始终代理的域名后缀'),
                                          ('--direct-cidr', '始终直连的 IP/CIDR'), ('--proxy-cidr', '始终代理的 IP/CIDR')):
@@ -684,7 +712,12 @@ def menu(state_root):
             for command in commands:
                 execute(parser().parse_args(['--state', str(state_root), *command]))
             if commands:
-                print('操作完成')
+                if choice == '4' and action in ('1', '2', '3') and apply_now.lower() == 'n':
+                    print('配置已保存；需要生效时，选择主菜单 4 的子项 4 应用并重启附件代理。')
+                else:
+                    print('操作完成')
+        except MenuBack:
+            continue
         except (ConfigError, RuntimeError) as error:
             print(str(error), file=sys.stderr)
         except SystemExit:
